@@ -1,7 +1,7 @@
 # hiv_prep_bc
 
 ## Description
-Source code and summary tables for analyses within the pre-print [McLaughlin et al., 2024, medRxiv](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1) and peer-reviewed manuscript in review [insertfinallinkhere](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1).
+Source code and summary tables for analyses within the pre-print [McLaughlin et al., 2024, medRxiv](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1) and peer-reviewed manuscript [in review PloS Medicine](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1).
 
 ## Dependencies
 This pipeline was run on macOS Ventura 13.5.2
