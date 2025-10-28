@@ -18,7 +18,8 @@ This pipeline was run on macOS Ventura 13.5.2
 * IQTREE-2.1.2
 
 ### R packages - CHECK
-tidyverse 2.0.0, ape 5.4-1, Biostrings 3.1.3, phytools 0.7-70, phangorn 2.5.5,stringi 1.5.3, RColorBrewer 1.1-2, cowplot 1.1.164, ggtree 2.2.4, ggplotify 0.0.5.
+tidyverse 2.0.0, plyr 1.8.9, seqinr 4.2.36, geiger 2.0.11, ape 5.8, 
+Biostrings 3.1.3, phytools 0.7-70, phangorn 2.5.5,stringi 1.5.3, RColorBrewer 1.1-2, cowplot 1.1.164, ggtree 2.2.4, ggplotify 0.0.5.
 * EpiEstim ****
 * 
 ## Usage
