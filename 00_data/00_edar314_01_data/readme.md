@@ -1,2 +1,2 @@
 # 00_edar314_01_data
-Raw data cannot be provided to protect their confidentiality and privacy, but we have included the data dictionary of metadata variables that are provided by the BC-CfE and the DTP for this analysis.
+Raw data cannot be provided to protect patient confidentiality and privacy, but we have included the data dictionary of metadata variables that are provided by the BC-CfE and the DTP for this analysis.
