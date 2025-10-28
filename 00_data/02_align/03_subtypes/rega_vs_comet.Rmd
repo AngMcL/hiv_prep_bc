@@ -1,0 +1,179 @@
+---
+title: "Untitled"
+author: "Angela"
+date: '2023-03-21'
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(ape)
+```
+
+```{r}
+#COMET subtypes
+int.comet<-read.csv("int_uniqID_COMETsubtypes.csv")
+pol.comet<-read.csv("pol_uniqID_COMETsubtypes.csv")
+```
+
+## Rega input
+```{r}
+keepcols<-c("name","rule","assignment","support","scan_best_support","pure","pure_support","pure_inner","pure_outer","crf","crf_support","crf_inner","crf_outer")
+
+#pol low boots
+pol.rega<-read.csv("REGA_pol/results.csv",sep=";")
+pol.rega<-pol.rega[,which(colnames(pol.rega) %in% keepcols)]
+
+#pol na boots
+pol.rega.na<-read.csv("REGA_pol_NA/results.csv",sep=";")
+pol.rega.na<-pol.rega.na[,which(colnames(pol.rega.na) %in% keepcols)]
+
+
+#int low
+int.rega<-read.csv("REGA_int/results.csv",sep=";")
+int.rega<-int.rega[,which(colnames(int.rega) %in% keepcols)]
+
+#int na boots
+int.rega.na<-read.csv("REGA_int_NA/results.csv",sep=";")
+int.rega.na<-int.rega.na[,which(colnames(int.rega.na) %in% keepcols)]
+
+#JOIN these together
+pol.rega<-bind_rows(pol.rega,pol.rega.na)
+int.rega<-bind_rows(int.rega,int.rega.na)
+
+nrow(pol.rega)
+nrow(int.rega)
+```
+
+#Compare comet to rega for the low bootstrap support ones for pol
+```{r}
+#issue with cutoff names with toomany chars
+# which(!pol.rega$name %in% pol.comet$tip.label)
+
+#parse to match
+pol.rega<-pol.rega %>% separate(name,as.character(c(1:2)),sep="_",remove=F)
+pol.rega<-pol.rega %>% unite(col=shortname, 2:3)
+# head(pol.rega)
+pol.comet<-pol.comet %>% separate(tip.label,as.character(c(1:2)),sep="_",remove=F)
+pol.comet<-pol.comet %>% unite(col=shortname, 2:3)
+# head(pol.comet)
+which(!pol.rega$shortname %in% pol.comet$shortname) #all match now
+
+#leftjoin the rega data onto the comet data
+pol.all<-left_join(pol.comet,pol.rega,by="shortname")
+# head(pol.all[which(pol.all$bootstrap.support<90),])
+
+#make these more comparable
+pol.all$assignment<-str_replace_all(pol.all$assignment,"HIV-1 Subtype ","")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"A \\(01_AE\\)","01_AE")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"A \\(A1\\)","A1")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"F \\(F1\\)","F1")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"G \\(02_AG\\)","02_AG")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"A \\(35_AD\\)","35_AD")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"D \\(19_cpx\\)","19_cpx")
+pol.all$assignment<-str_replace_all(pol.all$assignment,"HIV-1 ","")
+ 
+unique(pol.all$assignment)
+
+#replace NAs with the bootscan value
+nasupport<-which(is.na(pol.all$support) & 
+                         pol.all$bootstrap.support<90)
+pol.all[nasupport,'support']<-round(pol.all[nasupport,'scan_best_support']*100)
+
+#take the assignment from REGA and support value where COMET boots<90
+pol.all$finalsub<-NA
+pol.all$finalboot<-NA
+pol.all$choice<-NA
+for(i in 1:nrow(pol.all)){
+  if(is.na(pol.all$bootstrap.support[i])){next} #remove this once we have the na results
+  if(pol.all$bootstrap.support[i]>=90){ #if it is greater than 90, then we use COMET
+    pol.all$finalsub[i]<-pol.all$subtype[i]
+    pol.all$finalboot[i]<-pol.all$bootstrap.support[i]
+    pol.all$choice[i]<-"comet"
+    next}
+  if(pol.all$bootstrap.support[i]<90){ #else:
+    pol.all$finalsub[i]<-pol.all$assignment[i]
+    pol.all$finalboot[i]<-pol.all$support[i]
+    pol.all$choice[i]<-"rega"
+    }
+}
+
+table(pol.all$finalsub)
+
+#generate a final table for export
+pol.final<-pol.all[,c("tip.label","finalsub","finalboot","choice")]
+write.csv(pol.final,"pol_uniqID_finalSubtypes.csv")
+```
+
+#Compare comet to rega for the low bootstrap support ones for int
+```{r}
+#issue with cutoff names with toomany chars
+# which(!int.rega$name %in% int.comet$tip.label)
+
+#parse to match
+int.rega<-int.rega %>% separate(name,as.character(c(1:2)),sep="_",remove=F)
+int.rega<-int.rega %>% unite(col=shortname, 2:3)
+# head(int.rega)
+int.comet<-int.comet %>% separate(tip.label,as.character(c(1:2)),sep="_",remove=F)
+int.comet<-int.comet %>% unite(col=shortname, 2:3)
+# head(int.comet)
+which(!int.rega$shortname %in% int.comet$shortname) #all match now
+
+#leftjoin the rega data onto the comet data
+int.all<-left_join(int.comet,int.rega,by="shortname")
+# head(int.all[which(int.all$bootstrap.support<90),])
+
+#make these more comparable
+int.all$assignment<-str_replace_all(int.all$assignment,"HIV-1 Subtype ","")
+int.all$assignment<-str_replace_all(int.all$assignment,"HIV-1 ","")
+int.all$assignment<-str_replace_all(int.all$assignment,"A \\(01_AE\\)","01_AE")
+int.all$assignment<-str_replace_all(int.all$assignment,"A \\(A1\\)","A1")
+int.all$assignment<-str_replace_all(int.all$assignment,"A \\(A2\\)","A2")
+int.all$assignment<-str_replace_all(int.all$assignment,"F \\(F1\\)","F1")
+int.all$assignment<-str_replace_all(int.all$assignment,"G \\(02_AG\\)","02_AG")
+int.all$assignment<-str_replace_all(int.all$assignment,"A \\(35_AD\\)","35_AD")
+int.all$assignment<-str_replace_all(int.all$assignment,"D \\(19_cpx\\)","19_cpx")
+int.all$assignment<-str_replace_all(int.all$assignment,"C \\(31_BC\\)","31_BC")
+int.all$assignment<-str_replace_all(int.all$assignment,"C \\(07_BC\\)","07_BC")
+unique(int.all$assignment)
+
+
+#replace NAs with the bootscan value
+nasupport<-which(is.na(int.all$support) & 
+                         int.all$bootstrap.support<90)
+int.all[nasupport,'support']<-round(int.all[nasupport,'scan_best_support']*100)
+
+#take the assignment from REGA and support value where COMET boots<90
+int.all$finalsub<-NA
+int.all$finalboot<-NA
+int.all$choice<-NA
+for(i in 1:nrow(int.all)){
+  if(is.na(int.all$bootstrap.support[i])){next} #remove this once we have the na results
+  if(int.all$bootstrap.support[i]>=90){ #if it is greater than 90, then we use COMET
+    int.all$finalsub[i]<-int.all$subtype[i]
+    int.all$finalboot[i]<-int.all$bootstrap.support[i]
+    int.all$choice[i]<-"comet"
+    next}
+  if(int.all$bootstrap.support[i]<90){ #else:
+    int.all$finalsub[i]<-int.all$assignment[i]
+    int.all$finalboot[i]<-int.all$support[i]
+    int.all$choice[i]<-"rega"
+    }
+}
+
+table(int.all$finalsub)
+
+#generate a final table for export
+int.final<-int.all[,c("tip.label","finalsub","finalboot","choice")]
+write.csv(int.final,"int_uniqID_finalSubtypes.csv")
+```
+
+## Okay so based on all this: what is the distribution of subtypes in the sample
+```{r}
+sort(table(pol.final$finalsub),decreasing = T)
+sort(table(int.final$finalsub),decreasing = T)
+
+```
+
+
+

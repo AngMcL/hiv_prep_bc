@@ -1,0 +1,2 @@
+
+ViralMSA.py -s 00_unaligned/pol_uniqID_refs.fasta -r 01_ref_DRMs/HXB2.fasta -o aligned -a minimap2 -t 4 -e <my-email@gmail.com>

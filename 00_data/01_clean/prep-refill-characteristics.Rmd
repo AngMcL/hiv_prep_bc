@@ -1,0 +1,274 @@
+---
+title: "refill"
+output: html_document
+date: "2023-11-24"
+---
+
+## objectives
+* evaluate prep refill characteristics among puws (incl if only 1 scrip)
+* compare those with and without DRMs
+
+```{r}
+library(tidyverse)
+
+prep.in<-"../00_edar314_01_data/E314_01_PREP_DRG_HIST.csv"
+#gnereated in the check clean data as below
+prep.in2<-"clean_output/prep.csv"
+prep.summ.in<-"clean_output/prepRefill.csv"
+dtp.in<-"clean_output/phyloDTP.csv"
+
+```
+
+## read in prep data
+```{r}
+#READ in cleaned prep data
+prep<-read.csv(prep.in2)
+# head(prep)
+# nrow(prep)
+length(unique(prep$PATID)) #42
+#need to remove the pats who never filled the scrip
+
+# read in summarized refill charactersi
+prep.ref<-read.csv(prep.summ.in)
+nrow(prep.ref)
+
+## read in dtp data
+dtp<-read.csv(dtp.in)
+table(dtp$PREP)
+
+#this shows 47 had prep scrips
+length(which(!is.na(dtp$PREP_DISP_DT))) #39 with a disp date
+length(table(dtp$PREP_REQ_DT)) #47 with a requisition
+length(table(dtp$PREP_SERO_DT)) #45
+
+#list of patients who had a disp
+prep.pats<-unique(dtp$PATID[which(!is.na(dtp$PREP_DISP_DT))])
+# dtp$PREP_DISP_DT[which(!is.na(dtp$PREP_DISP_DT))]
+length(prep.pats)
+# prep.pats
+
+#restrict the prep dataframe above to these pats
+prep<-prep %>% filter (PATID %in% prep.pats)
+length(unique(prep$PATID)) #39 #nice
+
+## distributino of number of days sicne last scrip to seroconversion among puws
+dtp.prep<-dtp[which(dtp$PATID %in% prep.pats),]
+dtp.prep<-dtp.prep %>% mutate(delay=as.Date(PREP_SERO_DT)- as.Date(PREP_DISP_DT))
+dtp.prep$delay
+#unclear if this is first or last disp... match by patid onto the prep data
+# prep<-prep %>% left_join(dtp.prep[,c("PREP_SERO_DT","PATID")], by="PATID")
+```
+
+```{r}
+## make a df that is one row per PUWS, similar to the summ above but not excluding those with only 1 scrip
+puws<-dtp.prep[,c("PATID","PREP_DISP_DT","PREP_REQ_DT","PREP_SERO_DT","FARVDT")]
+#Earliest PrEP dispense date. Custom variable for eDAR 314
+# Earliest PrEP request date (note some did not actually receive dispensed PrEP). Custom variable for eDAR 314
+# Date of seroconversion while in PrEP program. Custom variable for eDAR 314
+puws$PREP_DISP_DT<-as.Date(puws$PREP_DISP_DT)  
+puws$PREP_REQ_DT<-as.Date(puws$PREP_REQ_DT)  
+puws$PREP_SERO_DT<-as.Date(puws$PREP_SERO_DT)  
+puws$FARVDT<-as.Date(puws$FARVDT)  
+# 
+# #new cols
+# puws$n.prescrip<-NA
+# puws$PREP_FIRST_DISP_DT<-NA
+# puws$PREP_LAST_DISP_DT<-NA
+# puws$TOTAL_DOSES<-NA
+
+##find earliest prep dates
+for (i in 1:nrow(puws)){
+  pat<-puws$PATID[i]
+  match<-which(prep$PATID==pat)
+  puws$n.prescrip[i]<-length(match)
+  disps<-sort(prep$ACTUAL_DATE [match]) #all dispensation dates for this pat
+  puws$PREP_LAST_DISP_DT[i]<-last(disps)
+  puws$PREP_FIRST_DISP_DT[i]<-first(disps)
+  puws$LAST_DISP_QTY[i]<-prep$QTY[which(prep$PATID==pat & prep$ACTUAL_DATE==last(disps))]
+  #total days covered
+  puws$TOTAL_DOSES[i]<-sum(prep$QTY[match])
+}
+
+#NOW make a new column for difference in serodt and last disp
+puws$PREP_LAST_DISP_DT<-as.Date(puws$PREP_LAST_DISP_DT)
+puws$PREP_FIRST_DISP_DT<-as.Date(puws$PREP_FIRST_DISP_DT)
+puws <- puws %>% mutate(delay_sero_last_pres=PREP_SERO_DT - PREP_LAST_DISP_DT,
+                delay_sero_last_dose=PREP_SERO_DT - PREP_LAST_DISP_DT - LAST_DISP_QTY,
+                delay_farv_last_pres=FARVDT - PREP_LAST_DISP_DT,
+                delay_farv_last_dose=FARVDT - PREP_LAST_DISP_DT - LAST_DISP_QTY)
+
+## look at the distribtuion of delays
+ggplot(puws)+ 
+  geom_density(aes(x=delay_sero_last_dose))
+
+pats.nrti.prep<-c("2897232925","3433806820","1197344987")
+puws$delay_sero_last_dose[puws$PATID %in% pats.nrti.prep]
+puws$delay_farv_last_dose[puws$PATID %in% pats.nrti.prep]
+puws$delay_farv_last_pres[puws$PATID %in% pats.nrti.prep]
+
+puws$PATID[puws$PATID %in% pats.nrti.prep]
+
+## add a column for whether nrti resistance or not
+puws$NRTI_RES<-0
+puws$NRTI_RES[which(puws$PATID %in% pats.nrti.prep)]<-1
+puws$NRTI_RES<-factor(puws$NRTI_RES)
+kruskal.test(puws$delay_sero_last_dose, puws$NRTI_RES)
+
+ggplot(puws)+ 
+  geom_density(aes(x=delay_sero_last_dose, group=NRTI_RES,color=NRTI_RES))
+
+```
+
+## join on the previously calculated columns from refills 
+```{r}
+class(puws$PATID)<-"character"
+puws.full<-puws %>% left_join(prep.ref, by="PATID")
+
+head(puws.full,n=12)
+
+#summarize key stats
+summary(puws.full$n.prescrip)
+summary(puws.full$n.prescrip[puws.full$NRTI_RES==1])
+
+summary(puws.full$TOTAL_DOSES)
+summary(puws.full$TOTAL_DOSES[puws.full$NRTI_RES==1])
+
+summary(puws.full$)
+summary(puws.full$TOTAL_DOSES[puws.full$NRTI_RES==1])
+
+#time from last to sero
+summary(as.numeric(puws.full$delay_sero_last_pres))
+summary(as.numeric(puws.full$delay_sero_last_pres[puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$delay_sero_last_pres[puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$delay_sero_last_pres, puws.full$NRTI_RES) #p-value = 0.06507
+
+summary(as.numeric(puws.full$delay_farv_last_pres))
+summary(as.numeric(puws.full$delay_farv_last_pres[puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$delay_farv_last_pres[puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$delay_farv_last_pres, puws.full$NRTI_RES) #p-value = 0.0452
+
+#how many?
+length(which(puws.full$delay_sero_last_pres<=90)) #6
+length(which(puws.full$delay_sero_last_pres<=90 &
+               puws.full$NRTI_RES==1)) #2
+puws.full$delay_sero_last_pres[which(puws.full$delay_sero_last_pres<=90 &
+               puws.full$NRTI_RES==1)]
+
+
+length(which(puws.full$delay_farv_last_pres<=90)) #5
+length(which(puws.full$delay_sero_last_dose<=90)) #9
+length(which(puws.full$delay_sero_last_dose<=90 &
+               puws.full$NRTI_RES==1)) #2
+
+length(which(puws.full$delay_farv_last_dose<=90)) #8
+
+#total days with no refill
+summary(as.numeric(puws.full$total.days.no.refill))
+summary(as.numeric(puws.full$total.days.no.refill [puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$total.days.no.refill [puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$total.days.no.refill, puws.full$NRTI_RES) #p-value = 0.1096
+puws.full$total.days.no.refill[puws.full$NRTI_RES==1]  # NA 203 290
+sort(puws.full$total.days.no.refill[puws.full$NRTI_RES==1])
+sort(puws.full$total.days.no.refill[puws.full$NRTI_RES==0])
+#max days with no refill
+summary(as.numeric(puws.full$max.days.no.refill))
+summary(as.numeric(puws.full$max.days.no.refill [puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$max.days.no.refill [puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$max.days.no.refill, puws.full$NRTI_RES) # p-value = 0.05193
+puws.full$max.days.no.refill[puws.full$NRTI_RES==1] #NA 155 229
+
+#median days with no refill
+summary(as.numeric(puws.full$median.days.no.refill))
+summary(as.numeric(puws.full$median.days.no.refill [puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$median.days.no.refill [puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$median.days.no.refill, puws.full$NRTI_RES) # p-value = 0.3601
+puws.full$median.days.no.refill[puws.full$NRTI_RES==1] #NA 155 229
+
+#proportion days with no refill
+summary(as.numeric(puws.full$prop.days.no.refill))
+summary(as.numeric(puws.full$prop.days.no.refill [puws.full$NRTI_RES==0]))
+summary(as.numeric(puws.full$prop.days.no.refill [puws.full$NRTI_RES==1]))
+kruskal.test(puws.full$prop.days.no.refill, puws.full$NRTI_RES) # p-value == 0.05213
+sort(puws.full$prop.days.no.refill[puws.full$NRTI_RES==1])
+sort(puws.full$prop.days.no.refill[puws.full$NRTI_RES==0])
+
+
+```
+
+
+
+```{r}
+### calculate gaps in refills (days not covered between refills)
+#find patients with refills
+multifill<-table(prep$PATID)[which(table(prep$PATID)>1)]
+multi_nm<-names(multifill)
+#make a new column for days until next refill
+prep$days_until_refill<-NA
+#for each patients with refill
+for (i in 1:length(multi_nm)){
+  rowz<-which(prep$PATID==multi_nm[i])
+  for (j in 1:(length(rowz)-1)){ #go until the second last refill date
+    #find date dispensed
+    dt<-prep$ACTUAL_DATE[rowz[j]]
+    #add the number of expiry days
+    dt.ex<-dt+prep$EXPIRY_DAYS[rowz[j]]
+    #calculate days until next date of refill after expiry
+    prep$days_until_refill[rowz[j]]<-as.numeric(prep$ACTUAL_DATE[rowz[j+1]]-dt.ex)
+  }
+}
+
+#select rows with multiple refills to look at refill patterns, gaps 
+prep_ref<-prep[which(prep$PATID %in% multi_nm),]
+prep_summ<-prep_ref %>% dplyr::group_by(PATID) %>%
+  dplyr::summarise(.groups='rowwise',
+                   total.refills=n(),
+                   total.days.tx=sum(EXPIRY_DAYS),
+                   first.disp=first(ACTUAL_DATE),
+                   last.disp=last(ACTUAL_DATE),
+                   #total period of PrEP use from first to last dispense + last expiry
+                   total.disp.period=as.numeric(last(ACTUAL_DATE) - first(ACTUAL_DATE) + last(EXPIRY_DAYS)),
+                   total.days.covered=sum(QTY,na.rm=T),
+                   total.days.no.refill=sum(days_until_refill,na.rm=T),
+                   mean.days.no.refill=mean(days_until_refill,na.rm=T),
+                   median.days.no.refill=median(days_until_refill,na.rm=T),
+                   max.days.no.refill=max(days_until_refill,na.rm=T),
+                   min.days.no.refill=min(days_until_refill,na.rm=T)) %>%
+  as.data.frame() %>% 
+  #proportion of days where there was no refill of total period of prep use 
+  mutate(prop.days.no.refill=total.days.no.refill/total.disp.period,
+         prop.days.covered=total.days.covered/total.disp.period)
+prep_summ<-prep_summ[with(prep_summ,order(prep_summ$total.refills,decreasing = T)),]
+
+#calculate median and mean across table
+mean_summ<-prep_summ  %>% summarise(across(setdiff(everything(),one_of("PATID")), list(mean)))
+# median_summ<-prep_summ[,] %>%  summarise(across(setdiff(everything(),one_of("PATID")), list(median,na.rm=T)))
+#workaround for now
+median_summ<-mean_summ 
+num_cols<-c(2,3,6:14)
+median_summ[,(num_cols-1)]<-lapply(prep_summ[num_cols], function(x) median(x)) #-1 b/c no patid
+confint_summ<-prep_summ %>% summarise(across(setdiff(everything(),one_of("PATID")), list(sd)))
+
+mean_summ$PATID_1<-"mean"
+median_summ$PATID_1<-"median"
+nc<-ncol(mean_summ)
+mean_summ<-mean_summ[,c(nc,1:(nc-1))]
+median_summ<-median_summ[,c(nc,1:(nc-1))]
+colnames(mean_summ)<-colnames(prep_summ)
+colnames(median_summ)<-colnames(prep_summ)
+
+#rbind thes e on
+prep_summ<-rbind(prep_summ, mean_summ, median_summ)
+
+#show summary 
+prep_summ
+
+#interested in patient 2897232925
+t.test(x=prep_summ$prop.days.no.refill,
+       mu = prep_summ$prop.days.no.refill[prep_summ$PATID=="2897232925"],
+       alternative = "two.sided")
+ # p-value = 4.592e-06
+hist(prep_summ$prop.days.no.refill)
+
+```
+
+

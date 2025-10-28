@@ -1,0 +1,863 @@
+---
+title: "Data Checking and Cleaning"
+author: "Angela"
+date: "23/07/2021"
+output: html_document
+---
+
+## Objectives
+* check newest data request has same columns, structure as previous data
+* read in new dataset and inspect/explore, correct classes, check for missing data, compare similar columns
+* make new sequence ID column
+* make all dates "yyyy-mm-dd"
+
+## Exports
+* cleaned versions of all df
+* cleaned merged dataset with one row per patient and most recent measurement for longitudinally measured stuff, no seqs
+* pol sequences unaligned: all seqs with PAT_ID, all seqs with unique sample ID
+* integrase seqs unaligned: as above
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(plyr)
+library(ape)
+library(geiger)
+library(seqinr)
+```
+
+```{r data inputs and outputs}
+# INPUTS
+dat.dir<-"../00_edar314_01_data"
+files.in<-list.files(dat.dir, pattern=".csv",full.names = T)
+
+# OUTPUTS
+dir.out<-"clean_output/"
+if (!dir.exists(dir.out)) {dir.create(dir.out)}
+
+# cleaned versions of all df
+geo.hist.out<-paste(dir.out,"geo_hist.csv",sep="")
+cd4.out<-paste(dir.out,"cd4.csv",sep="")
+dtp.out<-paste(dir.out,"dtp.csv",sep="")
+drg.hist.out<-paste(dir.out,"drg_hist.csv",sep="")
+phylo.out<-paste(dir.out,"phylo.csv",sep="") 
+phylo.extra.out<-paste(dir.out,"phylo_int.csv",sep="") 
+prep.out<-paste(dir.out,"prep.csv",sep="") 
+prep.summ.out<-paste(dir.out,"prepRefill.csv",sep="") 
+reg.hist.out<-paste(dir.out,"reg_hist.csv",sep="")
+vload.out<-paste(dir.out,"vl.csv",sep="")
+
+# merged phyloDTP table with seqs 'string' removed
+phylo.dtp.out<-paste(dir.out,"phyloDTP.csv",sep="") #merged with cols from other tables (most recent if longitudinal)
+# wide.phylo.dtp.out<-paste(dir.out,"wide_phyloDTP_pat.csv",sep="") #as above, with important longitud (VL, CD4) in wide format "param_year"
+
+#alignments out
+align.out<-"../02_align/"
+# pol.out.everyseq<-paste(align.out,"pol_all.fasta",sep="")
+pol.out.all<-paste(align.out,"pol_uniqID.fasta",sep="")
+pol.out.samp<-paste(align.out,"pol_uniqSamp.fasta",sep="")
+
+int.out.all<-paste(align.out,"int_uniqID.fasta",sep="")
+int.out.samp<-paste(align.out,"int_uniqSamp.fasta",sep="")
+```
+
+## Data Exploration and Cleaning
+```{r read em, explore, and clean}
+## patient geography history
+geo_hist<-read.csv(files.in[1],header=T)
+#correct classes
+geo_hist<-geo_hist %>%
+  mutate(across(everything(), as.character))
+#convert dates to yyyy-mm-dd
+geo_hist$START_DT<-as.Date(geo_hist$START_DT,tryFormats = c("%m/%d/%Y"))
+geo_hist$END_DT<-as.Date(geo_hist$END_DT,tryFormats = c("%m/%d/%Y"))
+#change to 'PATID'
+colnames(geo_hist)<-str_replace_all(colnames(geo_hist),"HASH_PATID","PATID")
+#quick look
+# head(geo_hist)
+nrow(geo_hist) #48788
+length(unique(geo_hist$PATID)) #14918
+range(geo_hist$START_DT) # "1992-09-29" "2023-01-17"
+write.csv(geo_hist,geo.hist.out,row.names = F)
+
+
+## patient CD4 counts
+cd4<-read.csv(files.in[2],header=T)
+# str(cd4)
+#correct classes
+cd4<-cd4 %>% 
+  mutate(across(everything(),as.character))
+cd4$cd4<-as.numeric(cd4$RESULT)
+#convert dates to yyyy-mm-dd
+cd4$TESTDATE<-as.Date(cd4$TESTDATE,tryFormats = c("%m/%d/%Y"))
+cd4<-cd4[,-which(colnames(cd4)=="RESULT")]
+#change to 'PATID'
+colnames(cd4)<-str_replace_all(colnames(cd4),"HASH_PATID","PATID")
+# head(cd4)
+nrow(cd4) #587839
+length(unique(cd4$PATID)) #14644 (not all listed above)
+summary(as.vector(table(cd4$PATID))) #1-232 measurements, mean=40.14, median=28.0
+write.csv(cd4,cd4.out,row.names = F)
+
+## main DTP data table
+dtp<-read.csv(files.in[3],header=T)
+colnames(dtp)
+# str(dtp)
+#correct classes
+class(dtp$HASH_PATID)<-"character"
+#convert date columns
+#look for columns that have "DT" short for date in the name
+date_columns<-colnames(dtp)[str_which(colnames(dtp),"DT")]
+#remove the death columns from date cols
+date_columns<-date_columns[-str_which(date_columns,"DTH")]
+#couple more date cols to add 
+date_columns<-c(date_columns,"BIRTHDATE","F_REGIMEN_START")
+#change the dates
+dtp[,date_columns]<-lapply( dtp[date_columns],function(x) as.Date(x,tryFormats = c("%m/%d/%Y")) )
+# head(dtp[,date_columns])
+#look for dates outside reasonable range
+lapply(dtp[date_columns],function(x) summary(x))
+#these were weird...
+#VACBEGDT=First date of STI (supervised therapy interruption) 
+# dummy date = 01-JAN-2099 if never had STI
+dtp$VACBEGDT[which(dtp$VACBEGDT=="2099-01-01")]<-NA
+#check for non-unique patHASH_PATID
+length(dtp$HASH_PATID)==length(unique(dtp$HASH_PATID))
+#change to 'PATID'
+colnames(dtp)<-str_replace_all(colnames(dtp),"HASH_PATID","PATID")
+write.csv(dtp,dtp.out,row.names = F)
+
+## Drug history
+drg_hist<-read.csv(files.in[4],header=T)
+# head(drg_hist)
+# str(drg_hist)
+class(drg_hist$HASH_PATID)<-"character"
+drg_hist[,c("STARTDATE","STOPDATE")]<-lapply(drg_hist[,c("STARTDATE","STOPDATE")],
+                                             function(x) as.Date(x,tryFormats = c("%m/%d/%Y")) )
+#change to 'PATID'
+colnames(drg_hist)<-str_replace_all(colnames(drg_hist),"HASH_PATID","PATID")
+head(drg_hist)
+# nrow(drg_hist) 
+length(unique(drg_hist$PATID)) #14919
+summary(as.vector(table(drg_hist$PATID))) #1-284 drug histories (median 13, mean 20.96)
+write.csv(drg_hist,drg.hist.out,row.names = F)
+
+## INT sequences, predicted resistance scores/levels to all drugs
+phylo_extra<-read.csv(files.in[5],header=T)
+# str(phylo_extra)
+class(phylo_extra$HASH_PATID)<-"character"
+#change to 'PATID'
+colnames(phylo_extra)<-str_replace_all(colnames(phylo_extra),"HASH_PATID","PATID")
+#change "ENTERDATE" to yyyy-mm-dd
+phylo_extra$ENTERDATE<-as.Date(phylo_extra$ENTERDATE,tryFormats = c("%m/%d/%Y","%m/%d/%Y %H:%M:%S %p")) 
+#hold off on exporting until below
+
+## Phylowatch: pol sequences, predicted resistance
+phylo<-read.csv(files.in[6],header=T)
+# str(phylo)
+class(phylo$PATID)<-"character"
+#convert date columns
+date_columns<-colnames(phylo)[str_which(colnames(phylo),"DT|DATE")]
+date_columns<-c(date_columns,"FIRST_VL_ADI_ARV")
+phylo[,date_columns]<-lapply(phylo[date_columns],
+                             function(x) as.Date(x,tryFormats = c("%m/%d/%Y","%m/%d/%Y %H:%M:%S %p")) )
+#look for dates outside reasonable range
+# lapply(phylo[date_columns],function(x) summary(x))
+#overall look
+nrow(phylo) #42060 sequences
+length(unique(phylo$SAMPID)) #40087 unique samples, will have to reduce to unique samples
+length(unique(phylo$ENUM)) #41945 ENUM (one sample can have multiple ENUMS)
+# REMOVE any sequences with PATID=NA 
+na.pat<-which(is.na(phylo$PATID))
+length(na.pat) #17
+if(length(na.pat)>0){
+  phylo<-phylo[-na.pat,]
+}
+length(unique(phylo$PATID))
+#impute coldate for samples with no coldate
+no_coldate<-which(is.na(phylo$COLDATE))
+length(no_coldate) #20 samples with no collection date
+# phylo[no_coldate,c('DATE_REQUESTED','DATE_SEQ_UPLOADED')]
+#for seqs with no coldate:
+for (i in 1:length(no_coldate)){
+  #first look if they have a duplicate samp 
+  samp<-phylo$SAMPID[no_coldate[i]]
+  matchy<-which(phylo$SAMPID == samp)
+  #if the only instance of samp, find the median delay between date_requested and coldate for all samples requested +/- 6 months, then apply that
+  if (length(matchy)==1){ 
+    req<-phylo$DATE_REQUESTED[no_coldate[i]]
+    req.up<-ymd(req) %m+% months(6)
+    req.down<-ymd(req) %m-% months(6)
+    thatyear<-which(phylo$DATE_REQUESTED>req.down & phylo$DATE_REQUESTED>req.up)
+    median<-median(phylo$COLDATE[thatyear] - phylo$DATE_REQUESTED[thatyear], na.rm=T)
+    phylo$COLDATE[no_coldate[i]]<-req+median
+  }
+  #if there are other identical sample ID, take their coldate
+  if(length(matchy)>1){
+    print("matching sample")
+    #check they have a non-NA coldate first
+    datematch<-na.omit(phylo$COLDATE[matchy])
+    #if length >1, take first (should be identical) and print many
+    if (length(datematch)>1){datematch<-datematch[1]; print("many")}
+    #if there is a sample date, use it!
+    if (!is.na(datematch)){
+      phylo$COLDATE[no_coldate[i]]<-datematch
+    }
+  }
+}
+#check
+phylo[no_coldate,c('COLDATE','DATE_REQUESTED','DATE_SEQ_UPLOADED')]
+#now don't have to remove these :)
+# Sort by COLDATE
+phylo<-phylo[with(phylo,order(phylo$COLDATE, decreasing = F)),]
+range(phylo$COLDATE)
+
+# export below
+write.csv(phylo,phylo.out,row.names = F)
+
+## PrEP history
+prep<-read.csv(files.in[7],header=T)
+#change to 'PATID'
+colnames(prep)<-str_replace_all(colnames(prep),"HASH_PATID","PATID")
+length(unique(prep$PATID)) #42 patients!!
+
+#fix classes
+class(prep$PATID)<-"character"
+prep$ACTUAL_DATE<-as.Date(prep$ACTUAL_DATE,tryFormats = c("%m/%d/%Y"))
+
+#sort by date
+prep<-prep[with(prep,order(prep$ACTUAL_DATE)),]
+
+## issue where multiple prescrips issued to a given patient on a given day - remove dups
+remove<-c()
+un.pat<-unique(prep$PATID)
+for(i in 1:length(un.pat)){
+  pat.rows<-which(prep$PATID==un.pat[i])
+  expect<-length(unique(prep$ACTUAL_DATE[pat.rows])) #14
+  #identify duplicates, add to remove vector
+  rem<-pat.rows[which(duplicated(prep$ACTUAL_DATE[pat.rows]))]
+  # length(pat.rows)-length(rem)==expect
+  remove<-c(remove,rem)
+}
+#get rid of dups
+length(remove) #671
+prep<-prep[-remove,]
+
+# table(prep$PATID)
+# prep[prep$PATID=="3552964071",] #looks good
+
+nrow(prep) #122 prescriptions
+sum(as.numeric(prep$QTY),na.rm=T) #8798
+sum(as.numeric(prep$EXPIRY_DAYS),na.rm=T) #8708 
+
+#quick look (all TDF, 200-300mg tabs)
+table(prep$DRUG_NAME)
+table(prep$QTY)
+table(prep$EXPIRY_DAYS) #not same
+### how many refills?
+summary(as.vector(table(prep$PATID))) #1-14 refills (median=2,mean=2.9)
+
+range(prep$ACTUAL_DATE)
+# sort(table(prep$PATID),decreasing = T)
+# 
+# ### summarize total number of pills per patient
+prep %>% dplyr::group_by(PATID) %>%
+  summarize(sum.days=sum(QTY)) %>% as.data.frame()
+
+### calculate gaps in refills (days not covered between refills)
+#find patients with refills
+multifill<-table(prep$PATID)[which(table(prep$PATID)>1)]
+multi_nm<-names(multifill)
+#make a new column for days until next refill
+prep$days_until_refill<-NA
+#for each patients with refill
+for (i in 1:length(multi_nm)){
+  rowz<-which(prep$PATID==multi_nm[i])
+  for (j in 1:(length(rowz)-1)){ #go until the second last refill date
+    #find date dispensed
+    dt<-prep$ACTUAL_DATE[rowz[j]]
+    #add the number of expiry days
+    dt.ex<-dt+prep$EXPIRY_DAYS[rowz[j]]
+    #calculate days until next date of refill after expiry
+    prep$days_until_refill[rowz[j]]<-as.numeric(prep$ACTUAL_DATE[rowz[j+1]]-dt.ex)
+  }
+}
+
+#select rows with multiple refills to look at refill patterns, gaps 
+prep_ref<-prep[which(prep$PATID %in% multi_nm),]
+prep_summ<-prep_ref %>% dplyr::group_by(PATID) %>%
+  dplyr::summarise(.groups='rowwise',
+                   total.refills=n(),
+                   total.days.tx=sum(EXPIRY_DAYS),
+                   first.disp=first(ACTUAL_DATE),
+                   last.disp=last(ACTUAL_DATE),
+                   #total period of PrEP use from first to last dispense + last expiry
+                   total.disp.period=as.numeric(last(ACTUAL_DATE) - first(ACTUAL_DATE) + last(EXPIRY_DAYS)),
+                   total.days.covered=sum(QTY,na.rm=T),
+                   total.days.no.refill=sum(days_until_refill,na.rm=T),
+                   mean.days.no.refill=mean(days_until_refill,na.rm=T),
+                   median.days.no.refill=median(days_until_refill,na.rm=T),
+                   max.days.no.refill=max(days_until_refill,na.rm=T),
+                   min.days.no.refill=min(days_until_refill,na.rm=T)) %>%
+  as.data.frame() %>% 
+  #proportion of days where there was no refill of total period of prep use 
+  mutate(prop.days.no.refill=total.days.no.refill/total.disp.period,
+         prop.days.covered=total.days.covered/total.disp.period)
+prep_summ<-prep_summ[with(prep_summ,order(prep_summ$total.refills,decreasing = T)),]
+
+#calculate median and mean across table
+mean_summ<-prep_summ  %>% summarise(across(setdiff(everything(),one_of("PATID")), list(mean)))
+# median_summ<-prep_summ[,] %>%  summarise(across(setdiff(everything(),one_of("PATID")), list(median,na.rm=T)))
+#workaround for now
+median_summ<-mean_summ 
+num_cols<-c(2,3,6:14)
+median_summ[,(num_cols-1)]<-lapply(prep_summ[num_cols], function(x) median(x)) #-1 b/c no patid
+confint_summ<-prep_summ %>% summarise(across(setdiff(everything(),one_of("PATID")), list(sd)))
+
+mean_summ$PATID_1<-"mean"
+median_summ$PATID_1<-"median"
+nc<-ncol(mean_summ)
+mean_summ<-mean_summ[,c(nc,1:(nc-1))]
+median_summ<-median_summ[,c(nc,1:(nc-1))]
+colnames(mean_summ)<-colnames(prep_summ)
+colnames(median_summ)<-colnames(prep_summ)
+
+#rbind thes e on
+prep_summ<-rbind(prep_summ, mean_summ, median_summ)
+
+#show summary 
+prep_summ
+
+#interested in patient 2897232925
+t.test(x=prep_summ$prop.days.no.refill,
+       mu = prep_summ$prop.days.no.refill[prep_summ$PATID=="2897232925"],
+       alternative = "two.sided")
+ # p-value = 4.592e-06
+hist(prep_summ$prop.days.no.refill)
+
+#export
+write.csv(prep,prep.out,row.names = F)
+write.csv(prep_summ,prep.summ.out,row.names = F)
+
+## REG hist
+reg_hist<-read.csv(files.in[8], header=T)
+#change to 'PATID'
+colnames(reg_hist)<-str_replace_all(colnames(reg_hist),"HASH_PATID","PATID")
+# str(reg_hist)
+class(reg_hist$PATID)<-"character"
+#convert dates
+date_columns<-colnames(reg_hist)[str_which(colnames(reg_hist),"DT|DATE")]
+reg_hist[,date_columns]<-lapply(reg_hist[date_columns],
+                             function(x) as.Date(x,tryFormats = c("%m/%d/%Y","%m/%d/%Y %H:%M:%S %p")) )
+# lapply(reg_hist[date_columns],function(x) summary(x))
+nrow(reg_hist) #129425
+length(unique(reg_hist$PATID)) #14919 patients with reg hist
+# table(reg_hist$REGIMEN)
+# table(reg_hist$HAART)
+write.csv(reg_hist,reg.hist.out,row.names = F)
+
+## viral loads
+vload<-read.csv(files.in[9],header=T)
+#change to 'PATID'
+colnames(vload)<-str_replace_all(colnames(vload),"HASH_PATID","PATID")
+# str(vload)
+class(vload$PATID)<-"character"
+date_columns<-colnames(vload)[str_which(colnames(vload),"DT|DATE")]
+vload[,date_columns]<-lapply(vload[date_columns],
+                             function(x) as.Date(x,tryFormats = c("%m/%d/%Y","%m/%d/%Y %H:%M:%S %p")) )
+# head(vload)
+hist(log10(vload$VLOAD))
+nrow(vload) #603123
+length(unique(vload$PATID)) #13796
+length(unique(vload$PATID[which(vload$PATID %in% phylo$PATID)]))#10350 of PATPATID that also have a sequence
+write.csv(vload,vload.out,row.names = F)
+
+```
+
+## Extract the sequences for partial pol and integrase, reduce to unique IDs
+```{r Extract sequences for unique IDs}
+#working with the phylo df for partial pol and phylo_extra for int
+#first, work with partial pol
+#make sure no _ in these strings
+any(str_detect(string="_",phylo$PATID))
+any(str_detect(string="_",phylo$SAMPID))
+any(str_detect(string="_",phylo$ENUM))
+
+#make composite unique identifiers to link sequences back to patient data
+phylo$newID <- paste(phylo$PATID, phylo$SAMPID, phylo$ENUM, phylo$COLDATE, sep="_")
+
+#check uniqueness
+length(unique(phylo$newID)) #41942
+nrow(phylo) #42043
+length(unique(phylo$ENUM)) #41941
+length(unique(phylo$SAMPID)) #40083
+
+#IDENTIFY REPEAT SAMPLES, some of them don't differ in any regards besides string(seq)
+#some differ in seqs, LATEST_VL, DOC_POSTAL
+length(which(table(phylo$newID)==2)) #101 new PATID that are duplicate
+length(which(table(phylo$newID)>2)) #0 new PATID that are triplicate or more
+
+#generate list of redundant duplicates (deal with triplicates after)
+redund<-rownames(data.frame(which(table(phylo$newID)==2)))
+
+#loop through each redundant duplicate ID, make list of how they differ, keep second entry
+dup_differ<-c() #column entries that differ b/w identical samples/ENUMs
+rem<-c() #rows to remove because of redundant entry
+for (i in 1:length(redund)) {
+  redrows <- which(phylo$newID %in% redund[i])
+  for (k in 1:ncol(phylo)) {
+         if (!is.na(phylo[redrows[1],k]) & !is.na(phylo[redrows[2],k])){
+           if (phylo[redrows[1],k] != phylo[redrows[2],k]) {
+             #running list of columns that differ
+             dup_differ<-c(dup_differ,colnames(phylo)[k])
+             #print differing values, only for exploration
+             # print(phylo[redrows,k])
+             }
+           }
+
+  }
+  rem<-c(rem,redrows[2]) #add the second instance to a vector of rows to remove
+}
+
+#look at columns that were different between redundant PATID
+table(dup_differ)
+#differ based on 1 of: "LATEST_VL","DOC_POSTAL","END_FOLLOW_STATUS","GENDER", others..
+#looks like generally the first instance has more columns filled, so take the first
+
+#remove them
+length(rem) #101
+if(length(rem)>0){
+  phylo<-phylo[-rem,]
+}
+
+nrow(phylo)
+#confirm no more duplicate newID
+length(which(table(phylo$newID)==2)) #0 new PATID that are duplicate
+
+#how many more triplicates?
+trippy<-which(table(phylo$newID)>2) #0 new PATID that are triplicate - no longer any
+length(trippy)
+
+# IF THERE ARE TRIPLICATES
+# if(length(trippy)>0){
+#   #generate list of redundant PATID that are triplicates
+#   redund_trip<-rownames(data.frame(which(table(phylo$newID)>2)))
+#   
+#   # loop through triplicates to figure out all the ways that they differ
+#   rem<-c() #redundant rows to remove
+#   for (i in 1:length(redund_trip)) {
+#     redrows<-which(phylo$newID %in% redund_trip[i]) 
+#     #rows in phylo that match to each redundant ID
+#     # Compare the lengths of STRING for the redundant rows
+#     diff_31<-abs(length(unlist(strsplit(as.character(phylo[redrows[3],"STRING"]),split="")))-length(unlist(strsplit(as.character(phylo[redrows[1],"STRING"]),split=""))))
+#     diff_21<-abs(length(unlist(strsplit(as.character(phylo[redrows[2],"STRING"]),split="")))-length(unlist(strsplit(as.character(phylo[redrows[1],"STRING"]),split=""))))
+#     diff_32<-abs(length(unlist(strsplit(as.character(phylo[redrows[3],"STRING"]),split="")))-length(unlist(strsplit(as.character(phylo[redrows[2],"STRING"]),split=""))))
+#     # if sum of differences is >10, then assume they need to be concatenated and keep all for now
+#     # if <10 STRING diffs look to see if they differ by other columns
+#     if (sum(diff_31,diff_21,diff_32)<10) {
+#         for (k in 1:ncol(phylo)) {
+#           if (!is.na(phylo[redrows[1],k]))
+#           if (phylo[redrows[1],k] != phylo[redrows[2],k] | phylo[redrows[1],k] != phylo[redrows[3],k] | phylo[redrows[3],k] != phylo[redrows[2],k] )
+#             print(paste(i, colnames(phylo)[k], sep=" "))
+#         }
+#     }
+#     rem<-c(rem,redrows[2:3])
+#   }
+#   # ALL differ only on the basis of doc_postal, which isn't imporatnt to us, so we will take the first instance
+#   # Interestingly, in the past, this was an issue with partial pol strings not being concatenated for older sequencing method...
+#   #have these now been concat'd within phylowatch?
+#   
+#   #remove the redundant rows
+#   if(length(rem)>0){
+#       phylo<-phylo[-rem,]
+#   }
+# } #end of triplicate loop
+
+#each row should have a unique ID now
+nrow(phylo)==length(unique(phylo$newID))
+
+#confirm that all triplicates were dealt with
+# rownames(data.frame(which(table(phylo$newID)>2))) #zero!
+
+#still one dup enum
+length(unique(phylo$ENUM)) #41941
+nrow(phylo) #41942
+phylo$newID[which(phylo$ENUM==phylo$ENUM[which(duplicated(phylo$ENUM))])]
+#different dates 2015-12-31" 2016-01-01"
+#take the earliest date
+dups<-which(phylo$ENUM==phylo$ENUM[which(duplicated(phylo$ENUM))])
+#remove the older
+phylo<-phylo[-dups[2],]
+
+#now the same:
+length(unique(phylo$ENUM)) #41941
+nrow(phylo) #41941
+
+#however, note that there are multiple ENUMs per SAMPLE still...
+length(unique(phylo$SAMPID)) #40083
+length(unique(phylo$PATID)) #10740
+
+#number of seqs per patient
+range(table(phylo$PATID)) #1-50
+median(table(phylo$PATID)) #2
+
+#we will have one alignment export with all sequences at this point (unique ENUM) and another export with unique sample
+
+## Clean and extract integrase sequences
+# nrow(phylo_extra)  #49762
+length(which(is.na(phylo_extra$INT_STRING))) #0
+length(which(nchar(phylo_extra$INT_STRING)==0)) #41003
+length(which(nchar(phylo_extra$INT_STRING)>0)) #8759 this is what we want to keep
+
+#reduce to non-zero INT_STRING
+phylo_extra<-phylo_extra[which(nchar(phylo_extra$INT_STRING)>0), ]
+nrow(phylo_extra) 
+
+#Make unique newID for integrase
+phylo_extra$newID <- paste(phylo_extra$PATID, phylo_extra$LP_SAMPID, phylo_extra$LP_ENUM, phylo_extra$ENTERDATE, sep="_")
+range(phylo_extra$ENTERDATE,na.rm=T)
+length(which(is.na(phylo_extra$ENTERDATE))) #309
+
+# head(phylo_extra[which(is.na(phylo_extra$ENTERDATE)),])
+#are they unique IDs? Yes!
+length(unique(phylo_extra$newID))==nrow(phylo_extra)
+#how many unique patients does this represent
+nrow(phylo_extra) 
+length(unique(phylo_extra$PATID)) #4058
+#how many seqs per patient
+summary(as.vector(table(phylo_extra$PATID))) #1-35, mean 2.2, median 1
+#how many unique samples
+length(unique(phylo_extra$LP_SAMPID)) 
+
+#how many patients have both partial pol and integrase
+both<-c()
+for (i in 1:length(unique(phylo_extra$PATID))){
+  if (phylo_extra$PATID[i] %in% phylo$PATID){ both<-c(both,phylo_extra$PATID[i])}
+}
+length(both) #4040/4058, nearly all
+# 4040/4058*100
+
+#same sample?
+boths<-c()
+for (i in 1:length(unique(phylo_extra$LP_SAMPID))){
+  if (phylo_extra$LP_SAMPID[i] %in% phylo$SAMPID){ boths<-c(boths,phylo_extra$LP_SAMPID[i])}
+}
+length(boths) #8148
+length(boths) /nrow(phylo_extra)*100
+
+#use this to try to recover the date for the mising ones
+nadat<-which(is.na(phylo_extra$ENTERDATE)) 
+length(nadat)#309
+matchdats<-c() #track those taht had match
+
+for (i in 1:length(nadat)){
+  matchy<-which(phylo$SAMPID %in% phylo_extra$LP_SAMPID[nadat[i]])
+  if(length(matchy)>0){
+    matchdats<-c(matchdats,i)
+    phylo_extra$ENTERDATE[nadat[i]]<-phylo$COLDATE[matchy]
+  }
+}
+length(matchdats) #289
+
+#remove the remaining na.dates
+nadat.still<-which(is.na(phylo_extra$ENTERDATE)) 
+length(nadat.still) #20
+phylo_extra<-phylo_extra[-nadat.still,]
+
+#repeat this with filled in dates
+phylo_extra$newID <- paste(phylo_extra$PATID, phylo_extra$LP_SAMPID, phylo_extra$LP_ENUM, phylo_extra$ENTERDATE, sep="_")
+
+#repeat summaries
+nrow(phylo_extra) #8739
+length(unique(phylo_extra$PATID)) #4058
+#how many seqs per patient
+summary(as.vector(table(phylo_extra$PATID))) #1-35, mean 2.2, median 1
+#date range
+range(phylo_extra$ENTERDATE)
+
+#for partial pol, what is the distribution of sequence lengths?
+table(nchar(phylo$STRING))
+ # 1005  1017  1497
+ #  709  6012 33346
+
+#for integrase, what is the distribution of sequence lengths?
+table(nchar(as.character(phylo_extra$INT_STRING)))
+# 864  867  870  876
+# 7003   19    6  120
+
+#check for commas or /, other weird characters
+str_which(",",phylo$newID)
+str_which(",",phylo_extra$newID)
+str_which("\\/",phylo$newID)
+str_which("\\/",phylo_extra$newID)
+
+#extract unaligned fasta from both objects, with only unique IDs (PATID_SAMP_ENUM_date)
+# write.fasta(sequences=as.list(as.character(phylo$STRING)),
+#             names=phylo$newID,
+#             file.out = pol.out.all,
+#             as.string = TRUE)
+# 
+# #export the integrase sequences as a fasta
+# write.fasta(sequences=as.list(as.character(phylo_extra$INT_STRING)),
+#             names=phylo_extra$newID,
+#             file.out = int.out.all,
+#             as.string = TRUE)
+
+write.csv(phylo,phylo.out,row.names = F)
+write.csv(phylo_extra,phylo.extra.out, row.names=F)
+```
+
+## Restrict the alignments to unique SAMP_ID (multiple ENUM per SAMP_ID)
+```{r}
+# new objects for unique samp
+phylo_samp<-phylo
+phylo_extra_samp<-phylo_extra
+
+# First, do pol
+length(unique(phylo_samp$SAMPID)) #40083, should be final rownumber
+length(unique(phylo_samp$newID)) #41941
+## identify samp_ID with multiple ENUMs
+redun<-names(which(table(phylo_samp$SAMPID)>1))
+#how many redunds per samp?
+table(table(phylo_samp$SAMPID) [which(table(phylo_samp$SAMPID)>1)] ) #up to 4
+length(redun) #1730
+
+#for each redundnat sample, compare which columns differ and then remove redunds 
+#looks like we should take the most recent date_requested (CONFIRM THIS WITH CHANSON, ZABRINA)
+rem<-c()
+dup_differ<-c()
+for (i in 1:length(redun)) {
+  redrows <- which(phylo_samp$SAMPID %in% redun[i]) 
+  for (k in 1:ncol(phylo_samp)) {
+         if (!is.na(phylo_samp[redrows[1],k]) & !is.na(phylo_samp[redrows[2],k])){
+           if (phylo_samp[redrows[1],k] != phylo_samp[redrows[2],k]) {
+             #running list of columns that differ
+             dup_differ<-c(dup_differ,colnames(phylo_samp)[k])
+             #print differing values, only for exploration
+             # print(phylo_samp[redrows,k])
+             }
+           }
+            
+  }
+  most.recent<-first(order(phylo_samp[redrows,'DATE_REQUESTED'],decreasing = T))
+  rem<-c(rem,redrows[-most.recent]) #add all but the most recent to removal vector
+}
+length(rem)
+
+#remove the redundants
+if(length(rem)>0){
+  phylo_samp<-phylo_samp[-rem,]
+}
+nrow(phylo_samp)==length(unique(phylo_samp$SAMPID)) #niiice
+range(table(phylo_samp$PATID))
+median(table(phylo_samp$PATID))
+
+# Repeat for integrase #
+length(unique(phylo_extra_samp$LP_SAMPID)) #8687, should be final rownumber
+length(unique(phylo_extra_samp$newID)) #8739, some extra
+
+## identify samp_ID with multiple ENUMs
+redun<-names(which(table(phylo_extra_samp$LP_SAMPID)>1))
+#how many redunds per samp?
+table(table(phylo_extra_samp$LP_SAMPID) [which(table(phylo_extra_samp$LP_SAMPID)>1)] ) #up to 3
+length(redun) #50
+
+#for each redundnat sample, compare which columns differ and then remove redunds 
+#looks like we should take the most recent ENTERDATE (CONFIRM THIS WITH CHANSON, ZABRINA)
+rem<-c()
+dup_differ<-c()
+for (i in 1:length(redun)) {
+  redrows <- which(phylo_extra_samp$LP_SAMPID %in% redun[i]) 
+  for (k in 1:ncol(phylo_extra_samp)) {
+         if (!is.na(phylo_extra_samp[redrows[1],k]) & !is.na(phylo_extra_samp[redrows[2],k])){
+           if (phylo_extra_samp[redrows[1],k] != phylo_extra_samp[redrows[2],k]) {
+             #running list of columns that differ
+             dup_differ<-c(dup_differ,colnames(phylo_extra_samp)[k])
+             #print differing values, only for exploration
+             # print(phylo_extra_samp[redrows,k])
+             }
+           }
+            
+  }
+  most.recent<-first(order(phylo_extra_samp[redrows,'ENTERDATE'],decreasing = T))
+  rem<-c(rem,redrows[-most.recent]) #add all but the most recent to removal vector
+}
+length(rem) #52
+
+#remove the redundants
+phylo_extra_samp<-phylo_extra_samp[-rem,]
+nrow(phylo_extra_samp)==length(unique(phylo_extra_samp$LP_SAMPID)) #niiice
+
+#for partial pol, what is the distribution of sequence lengths?
+table(nchar(phylo_samp$STRING))
+# 1005  1017  1497 
+#   624  5918 31994 
+
+#for integrase, what is the distribution of sequence lengths?
+table(nchar(as.character(phylo_extra_samp$INT_STRING)))
+# 864  867  870  876 
+# 6980   19    4  120
+
+nrow(phylo_samp) #40083
+nrow(phylo_extra_samp) #8687
+
+# EXPORT THE ALIGNMENTS with unique sample IDs
+# pol sequences
+# write.fasta(sequences=as.list(as.character(phylo_samp$STRING)),
+#             names=phylo_samp$newID,
+#             file.out = pol.out.samp,
+#             as.string = TRUE)
+# 
+# #integrase sequences
+# write.fasta(sequences=as.list(as.character(phylo_extra_samp$INT_STRING)),
+#             names=phylo_extra_samp$newID,
+#             file.out = int.out.samp,
+#             as.string = TRUE)
+
+```
+
+## Make a table with one row per patient (restricted to DTP and/or pol or int sequence)
+```{r}
+#make a version of phylo and phylo_extra that only have most recent sample
+# phylo$COLDATE # already ordered old to new
+keep<-c()
+for (i in nrow(phylo):1){ # go form newest to oldest
+  pat<-phylo$PATID[i]
+  if (pat %in% phylo$PATID[keep]) next
+  if (!pat %in% phylo$PATID[keep]) 
+    keep<-c(keep,i)
+}
+#check unique
+# which(table(phylo$PATID[keep])>1)
+length(unique(phylo$PATID))==length(keep)
+phylo_keep<-phylo[keep,]
+nrow(phylo_keep)
+
+#repeat for integrase
+keep<-c()
+for (i in nrow(phylo_extra):1){ # go form newest to oldest
+  pat<-phylo_extra$PATID[i]
+  if (pat %in% phylo_extra$PATID[keep]) next
+  if (!pat %in% phylo_extra$PATID[keep]) 
+    keep<-c(keep,i)
+}
+#check unique
+# which(table(phylo_extra$PATID[keep])>1)
+# length(unique(phylo_extra$PATID))==length(keep)
+phylo_extra_keep<-phylo_extra[keep,]
+nrow(phylo_extra_keep)
+
+#merge these together by patid
+colnames(phylo_extra_keep)[-1]<-paste("INT",colnames(phylo_extra_keep)[-1],sep="_")
+phylo_patient<-full_join(phylo_keep,phylo_extra_keep,by="PATID") #FULL JOIN KEEPS ALL ID FROM BOTH
+nrow(phylo_patient)==length(unique(c(phylo_extra$PATID,phylo$PATID)))
+#remove seq STRING
+phylo_patient<-phylo_patient[,-which(colnames(phylo_patient)%in%c("STRING","INT_INT_STRING"))]
+
+#how well do the patIDs match between DTP df and phylo?
+length(phylo_patient$PATID[which(!phylo_patient$PATID %in% dtp$PATID)]) #394 patients with a sequence but no DTP data
+length(dtp$PATID[which(!dtp$PATID %in% phylo_patient$PATID)]) #4529 DTP participants with no sequences
+length(phylo_patient$PATID[which(phylo_patient$PATID %in% dtp$PATID)]) #10390 patients with DTP data 
+
+
+# restrict to patients with DTP data AND/OR sequence (integrase or pol)
+dtp_seq<-dtp[which(dtp$PATID %in% phylo_patient$PATID),]
+nrow(dtp_seq)
+phylo_dtp<-full_join(dtp_seq,phylo_patient,by="PATID") #CHANGED this to a full_join from left_join 
+# head(phylo_dtp)
+nrow(phylo_dtp) #10784
+```
+
+## Compare redundant columns
+```{r}
+#note that columns suffixed with ".x" are from DTP while ".y" are from phylowatch
+
+# sex,gender
+table(phylo_dtp$SEX) #most accurate
+table(phylo_dtp$SEX_AT_BIRTH)
+table(phylo_dtp$GENDER) #has more missing data and only 1 MF
+
+# birthdate,year
+# diff<-c()
+for (i in 1:nrow(phylo_dtp)){
+  if (is.na(phylo_dtp$BIRTH_YEAR[i])) next
+  if (is.na(phylo_dtp$BIRTHDATE[i])) next
+  yr1<-as.numeric(unlist(strsplit(as.character(phylo_dtp$BIRTHDATE[i]),"-"))[1])
+  yr2<-phylo_dtp$BIRTH_YEAR[i]
+  if (yr1!=yr2){
+     # diff<-c(diff,i)
+     phylo_dtp$BIRTH_YEAR[i]<-yr1 #we trust this more
+  }
+}
+# phylo_dtp[diff,c("BIRTHDATE","BIRTH_YEAR")]
+
+# Remove cols differ, could check data dictionary here if needed
+# phylo_dtp[which(phylo_dtp$REMOVE.x != phylo_dtp$REMOVE_2),]
+# phylo_dtp[which(phylo_dtp$REMOVE.x != phylo_dtp$REMOVE.y),]
+# phylo_dtp[which(phylo_dtp$REMOVE.x != phylo_dtp$REMOVE.y), c("REMOVE.x","REMOVE_2","REMOVE.y")]
+table(phylo_dtp$REMOVE.x)
+table(phylo_dtp$REMOVE.y)
+table(phylo_dtp$REMOVE_2)
+
+# FIRST_NATION.x
+phylo_dtp[which(phylo_dtp$FIRST_NATION.x != phylo_dtp$FIRST_NATION.y), c("FIRST_NATION.x","FIRST_NATION.y")]
+
+#remove the second column, use first only and rename
+phylo_dtp<-phylo_dtp[,-which(colnames(phylo_dtp)=="FIRST_NATION.y")]
+colnames(phylo_dtp)[which(colnames(phylo_dtp)=="FIRST_NATION.x")]<-"FIRST_NATION"
+
+# FARVDT.y
+phylo_dtp[which(phylo_dtp$FARVDT.x != phylo_dtp$FARVDT.y), c("FARVDT.x","FARVDT.y")]
+#identical, get rid of second
+phylo_dtp<-phylo_dtp[,-which(colnames(phylo_dtp)=="FARVDT.y")]
+colnames(phylo_dtp)[which(colnames(phylo_dtp)=="FARVDT.x")]<-"FARVDT"
+
+# CMACA.x 
+phylo_dtp[which(phylo_dtp$CMACA.x != phylo_dtp$CMACA.y), c("CMACA.x","CMACA.y")]
+#some differences, maybe based on most recent vs first?
+#keep both for now
+
+# Risk factors
+#RSK_IDU_RA.y RSK_MSM_R.y RSK_HETERO_R.y RSK_BLOOD_R.y RSK_OTHER_R.y RSK_KNWN.y RSK_INFO.y HEPC.y
+# phylo_dtp[which(phylo_dtp$RSK_IDU_RA.x != phylo_dtp$RSK_IDU_RA.y), c("RSK_IDU_RA.x","RSK_IDU_RA.y")]
+table(phylo_dtp$RSK_IDU_RA.x)
+table(phylo_dtp$RSK_IDU_RA.y) # alot more unknowns
+
+# phylo_dtp[which(phylo_dtp$RSK_MSM_R.x != phylo_dtp$RSK_MSM_R.y), c("RSK_MSM_R.x","RSK_MSM_R.y")]
+table(phylo_dtp$RSK_MSM_R.x)
+table(phylo_dtp$RSK_MSM_R.y) # no unknowns
+
+# phylo_dtp[which(phylo_dtp$RSK_HETERO_R.x != phylo_dtp$RSK_HETERO_R.y), c("RSK_HETERO_R.x","RSK_HETERO_R.y")]
+table(phylo_dtp$RSK_HETERO_R.x)
+table(phylo_dtp$RSK_HETERO_R.y) #fewer unknowns, but those that are discordant tend to by 9 (unkonwn) in y
+
+# phylo_dtp[which(phylo_dtp$RSK_OTHER_R.x != phylo_dtp$RSK_OTHER_R.y), c("RSK_OTHER_R.x","RSK_OTHER_R.y")]
+table(phylo_dtp$RSK_OTHER_R.x)
+table(phylo_dtp$RSK_OTHER_R.y) # fewer unknowns
+
+# phylo_dtp[which(phylo_dtp$RSK_KNWN.x != phylo_dtp$RSK_KNWN.y), c("RSK_KNWN.x","RSK_KNWN.y")]
+table(phylo_dtp$RSK_KNWN.x)
+table(phylo_dtp$RSK_KNWN.y) #must be a lot of gaps, fewer of both 0 and 1
+
+# phylo_dtp[which(phylo_dtp$RSK_INFO.x != phylo_dtp$RSK_INFO.y), c("RSK_INFO.x","RSK_INFO.y")]
+table(phylo_dtp$RSK_INFO.x)
+table(phylo_dtp$RSK_INFO.y) #must be a lot of gaps, fewer of both 0 and 1
+
+# phylo_dtp[which(phylo_dtp$HEPC.x != phylo_dtp$HEPC.y), c("HEPC.x","HEPC.y")]
+table(phylo_dtp$HEPC.x)
+table(phylo_dtp$HEPC.y) #fewer of both 0 and 1
+
+#generally do we trust the DTP or phylowatch more for risk factor data? I would say DTP... ccertainly fewer gaps in the data
+```
+
+## export the merged dataset
+```{r}
+write.csv(phylo_dtp,phylo.dtp.out,row.names = F)
+```
+
+## NEXT
+Align sequence sets with sequence containing all DRMs (pol) and HXB2 (int) using MAFFT, or use ViralMSA and minimap2
+
+Trim out DRMs, INDELS, frayed ends
+
+Build 100 x ~ML trees for each set of sequences (partial pol, integrase)
+See 'fasttree.bootstrap.py'

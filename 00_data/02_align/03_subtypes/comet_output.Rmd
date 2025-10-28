@@ -1,0 +1,158 @@
+---
+title: "subtypes"
+author: "Angela"
+date: "30/07/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+# library(dplyr)
+# library(stringr)
+```
+
+```{r}
+files.in<-list.files(pattern=".tsv",full.names = T)
+# files.in[2]
+
+pol_df<-read.table(files.in[2],header=T,sep="\t")
+table(pol_df$subtype)
+nrow(pol_df)
+head(pol_df)
+
+sort(table(pol_df$subtype),decreasing = T)
+table(pol_df$bootstrap.support)
+
+#should investigate the subtype of the low boot support with another designation softward, REGA?
+table(pol_df$subtype[pol_df$bootstrap.support==100])
+table(pol_df$subtype[pol_df$bootstrap.support<90])
+
+#make a list of IDs with low bootstrap support <
+pol.low<-pol_df$tip.label[which(pol_df$bootstrap.support<90)]
+length(pol.low)
+
+pol_df<-pol_df[,-2]
+colnames(pol_df)[1]<-"tip.label"
+
+#export
+write.csv(pol_df,"pol_uniqID_COMETsubtypes.csv",row.names = F)
+```
+
+
+```{r}
+# INTEGRASE (one export)
+int_df<-read.table(files.in[1],header=T,sep="\t")
+
+length(which(int_df$subtype!="B"))
+length(which(int_df$subtype=="B"))
+
+#might want to confirm the CRFs using another method
+int_df<-int_df[,-2]
+colnames(int_df)[1]<-"tip.label"
+
+#low boots
+head(sort(table(int_df$subtype),decreasing = T))
+table(int_df$bootstrap.support)
+int.low<-int_df$tip.label[which(int_df$bootstrap.support<90)]
+length(int.low)
+
+#export
+write.csv(int_df,"int_uniqID_COMETsubtypes.csv",row.names = F)
+```
+
+## Subtype plots
+```{r}
+f.out<-"subtypes_plots/"
+if(!dir.exists(f.out)){dir.create(f.out)}
+
+pol_df$date<-as.Date(NA)
+for (i in 1:nrow(pol_df)){
+  pol_df$date[i]<-tail(unlist(strsplit(pol_df$tip.label[i],split="_")),n=1)
+}
+
+length(unique(pol_df$subtype))
+pol_df2<-pol_df
+pol_df2$subtype<-factor(pol_df2$subtype, levels= c(names (sort(table(pol_df$subtype),decreasing = T) )) )
+
+#overall how many of each subtype?
+morethan1<-names(table(pol_df$subtype))[which(table(pol_df$subtype)>3)]
+
+pol_df2 %>% 
+  filter(subtype %in% morethan1) %>%
+  ggplot()+
+    geom_bar(aes(x=subtype))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  ggtitle("HIV-1 subtypes in BC (w/ >3 samples)")
+
+ggsave(paste0(f.out,"HIV-1 subtypes in BC_comet.png"),height=3,width=6,units="in")
+
+#non B subtypes with more than 1 (actually 3)
+pol_df2 %>% 
+  filter(subtype != "B") %>%
+  filter(subtype %in% morethan1) %>%
+  ggplot()+
+    geom_bar(aes(x=subtype))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  ggtitle("Non-B subtypes in BC (w/ >3 samples)")
+
+ggsave(paste0(f.out,"Non-B subtypes in BC_comet.png"),height=3,width=6,units="in")
+
+#overall boot values
+pol_df %>%
+  filter(subtype %in% morethan1) %>%
+  filter(bootstrap.support<100)%>%
+  ggplot()+
+  geom_histogram(aes(x=bootstrap.support,fill=subtype),binwidth=2)+
+  geom_vline(xintercept=90,linetype=10)
+ggsave(paste0(f.out,"Bootstrap support by subtype (with more than 3)_comet.png"),height=3,width=6,units="in")
+
+
+```
+
+## make reduced fasta of the low support values
+```{r}
+pol.low
+int.low
+library(ape)
+pol.align<-read.FASTA("pol_uniqID_refs_align_subtypes.fasta")
+pol.align.low<-pol.align[which(names(pol.align) %in% pol.low)]
+length(pol.align.low)
+write.FASTA(pol.align.low, file="pol_uniqID_refs_align_subtypes_lowboots.fasta")
+
+
+int.align<-read.FASTA("int_uniqID_refs_align_subtypes.fasta")
+int.align.low<-int.align[which(names(int.align) %in% int.low)]
+length(int.align.low)
+write.FASTA(int.align.low, file="int_uniqID_refs_align_subtypes_lowboots.fasta")
+```
+
+## for patients with both pol and int, do the subtypes agree
+```{r}
+#PATID is first string before _
+head(pol_df$tip.label)
+pol_df<-pol_df%>% separate(tip.label, as.character(1:4),remove=F)
+pol_df$PATID<-pol_df$`1`
+table(pol_df$PATID)
+
+#first of all, are there instances of mis=matched subtypes within a given patient/gene
+multi<-names(table(pol_df$PATID)[table(pol_df$PATID)>1])
+multi
+pol_df_multi<-pol_df[which(pol_df$PATID %in% multi),]
+multi.sub.df<-table(pol_df_multi$PATID, pol_df_multi$subtype)
+dim(multi.sub.df)
+
+mismatch<-c()
+for (i in 1:nrow(multi.sub.df)){
+  unq.sub<-length(which(multi.sub.df[i,]>1))
+  if(unq.sub>1){mismatch<-c(mismatch, rownames(multi.sub.df)[i])}
+}
+mismatch #19 mismatches
+
+#check out the mix
+for (i in 1:length(mismatch)){
+  print(mismatch[i])
+  print(pol_df_multi$subtype[which(pol_df_multi$PATID==mismatch[i])])
+  print(pol_df_multi$date[which(pol_df_multi$PATID==mismatch[i])])
+}
+```
+
