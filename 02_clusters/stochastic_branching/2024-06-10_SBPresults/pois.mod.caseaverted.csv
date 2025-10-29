@@ -1,0 +1,6 @@
+factor,Mean,Lower 95% CI,Upper 95% CI,,
+(Intercept),29.1698,19.1228,44.2284,,
+log(size2017),1.0120,0.9680,1.0569,,
+% gbMSM,1.0016,1.0001,1.0031,,
+"median age, 2023",0.9906,0.9822,0.9991,,Those wit
+% residence Van. Coastal,1.0006,0.9980,1.0033,,

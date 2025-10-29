@@ -1,0 +1,1619 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-06-04"
+---
+
+#Objectives
+
+#SETUP
+```{r}
+library(tidyverse)
+library(cowplot)
+library(ConnMatTools)
+library(vctrs)
+library(fitdistrplus)
+library(boot)
+library(MASS)
+
+```
+
+#INs and OUTs
+```{r}
+#ins
+#Re values in
+re.in<-"../cluster_linelist/2024-08-22_Results/Re.epochal.clusters.csv"
+
+#seed size in
+seed.in<-"../cluster_linelist/2024-08-22_Results/Size2017.clusters.csv"
+
+#clust list in 
+clust.comp.in<-"../cluster_composition/2024-05-30_Results/ClusterComposition.csv"
+
+linelist.in<-"../cluster_linelist/2024-08-22_Results/cluster.linelist.csv"
+
+#outs
+today<-Sys.Date()
+f.out<-paste0(today,"_SBPresults/")
+if(!dir.exists(f.out)){dir.create(f.out)}
+```
+
+#plot theme
+```{r}
+pubTheme<-theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background=element_rect("grey95"), 
+                axis.line = element_line(colour = "black"),
+                text=element_text(size=10,face="bold"))
+
+riskcolz<-c("darkred","darkblue","darkorange3","darkgreen")
+names(riskcolz)<-c("All","GBM","PWID","HET")
+
+prepcolz<-c("maroon","orange3")
+names(prepcolz)<-c("PrEP","No PrEP")
+```
+
+# SETUP extra data
+```{r}
+#Re epochal predicted and observed
+re.t<-read.csv(re.in)
+re.t$date_start<-as.Date(re.t$date_start)
+re.t$date_end<-as.Date(re.t$date_end)
+
+#size at the end of 2017
+seed.df<-read.csv(seed.in)
+seed.df<-seed.df[,-1]
+#in each simulation, from the size in 2017, draw probability not on ART and not virally suppressed 
+#multiply by seed to get potential infectious seed size
+
+#clusters that are active and at least med size
+clust.comp<-read.csv(clust.comp.in)
+clust.comp<-clust.comp %>% filter (active==TRUE) %>% filter(medium==TRUE )
+clust.unq<-clust.comp$clusterID #ACTIVE clusters only
+ncl<-length(clust.unq)
+#add a risk col
+
+# find primary risk
+clust.comp$risk<-NA
+for (i in 1:nrow(clust.comp)){
+  #If NA, just say mixed
+  if(is.na(clust.comp$perc_MSM[i])){
+    clust.comp$risk[i]<-"mixed";next}
+
+  if(clust.comp$perc_MSM[i]>=50){
+    clust.comp$risk[i]<-"GBM"; next
+  }
+  if(clust.comp$perc_IDU[i]>=50){
+    clust.comp$risk[i]<-"PWID"; next
+  }
+  if(clust.comp$perc_HET[i]>=50){
+    clust.comp$risk[i]<-"HET"; next
+  }
+  #if none of these, then mixed
+  clust.comp$risk[i]<-"mixed"
+}
+
+
+clust.comp$active3<-FALSE
+clust.comp$active3[which(clust.comp$n_seroconv_2018>=3)]<-TRUE
+med.active.clust<-clust.comp$clusterID[which(clust.comp$active3==TRUE & clust.comp$medium==TRUE)]# >=size 10
+active.clust<-clust.comp$clusterID[which(clust.comp$active==TRUE)]
+#filter on this later
+# all(clust.unq %in% re.epoch$clusterID)
+# all(clust.unq %in% seed.df$clusterID)
+
+#clusters with no size in 2017 didn't start until 2018 or later
+#assign them size 1
+nosz<-clust.unq[which(!clust.unq %in% seed.df$clusterID)]
+seed.df2<-seed.df[1:length(nosz),]
+seed.df2$clusterID<-nosz
+seed.df2$size2017<-1
+seed.df<-seed.df %>% bind_rows(seed.df2)
+# all(clust.unq %in% seed.df$clusterID)
+
+## Observed new cases by cluster
+#Observed values
+#observed line lists of cluster diagnoses through time
+clust.linelist<-read.csv(linelist.in)
+
+#starts on
+dayzero<-as.Date("2018-01-01")
+
+#for each cluster, compare cumulative observed to predicted cases during date range
+clust.obs.cum<-clust.linelist %>% group_by(clusterID) %>%
+  # filter(clusterID %in% med.active.clust) %>%
+  filter(FIRST_VL_DATE>=dayzero) %>%
+  # group_by(FIRST_VL_DATE) %>%
+  dplyr::summarize(clusterID=clusterID[1],
+                   total.observed=n())
+  
+#compare daily observed and predicted new members
+clust.obs.cum$type<-"Observed"
+clust.obs.cum.medact<-clust.obs.cum %>%
+  filter(clusterID %in% med.active.clust) 
+
+```
+
+# Sticky  (and stochastic) branching process SBP
+```{r}
+# Inspired by code from
+# J. Riou, C. L. Althaus, Pattern of early human-to-human transmission of Wuhan 2019 novel coronavirus (2019-nCoV), December 2019 to January 2020. Eurosurveillance 25, 2000058 (2020).
+# C. L. Althaus, Ebola superspreading. Lancet Infect. Dis. 15, 507–508 (2015).
+# Premise of NEGBIN offspring r0 k from Lloyd-Smith et al. 2005
+# and from our SC2 travel restrictions in canada paper
+
+# simulation conditions 
+
+#Run with observed or predicted Re values
+#first run Re observerd intial=T, then Re observed inital=F, then Re_noPrEP with initial=f
+type.re<-"Re_NoPrEP" #"Re_observed"## # #  #
+initialrun<-FALSE #initial run TRUE if calculating seed adjust - shouldn't have to if have already run see seedadjust below
+
+#after 2018
+re.epoch<-re.t %>% filter(date_start >= as.Date("2018-01-01")) %>%
+  filter(Type==type.re)
+
+#if no value
+default.re<-0.8
+
+# Number of simulation runs per cluster
+n.runs<-4000 
+
+#serial interval (gamma dis)
+si.mu<-365
+si.sd<-182
+
+#calculate scale, shape and rate for SI
+#each run: walk around with rlnorm or unif small variation
+si.z<-gammaParamsConvert(mean=si.mu, sd=si.sd)
+si.shape<-si.z$shape
+si.scale<-si.z$scale
+si.rate<-1/si.scale
+
+# k dispersion parameter
+#each run runif()
+k.mean<-0.2
+k.min<-0.1
+k.max<-0.3
+
+# max time to run simulation
+max.long<-as.numeric(diff.Date(as.Date(c("2018-01-01","2022-12-31")))) #days
+
+#progress to 95-95-95 targets (Lima et al)
+p.caseperinfect<-p.diagnosed<-0.82 #P(diagnosed|infected) 
+p.art<-0.76 #P(on ART|diagnosed)
+p.suppressed<-0.83 #P(viral suppressed|on ART)
+p.seqpercase<-0.95 #P(sequence|diagnosed)
+
+#mutate initial seed size based on p.art p.suppressed p.seqpercase
+seed.df<-seed.df %>% mutate(seed.1 = ceiling((size2017 * 1/p.seqpercase * (1 - p.art) * (1 - p.suppressed) ) ))
+seed.df
+if(initialrun==FALSE){
+  #use seed.adjust to adjust starting seed
+  seed.adjust<-read.csv("2024-06-10_SBPresults/seed.adjust.csv")
+  # seed.adjust join if not done already
+  if(!any(colnames(seed.df)=="adjust.seed")){
+    seed.df<-seed.df %>% left_join(seed.adjust,by="clusterID")
+    seed.df$adjust.seed[which(is.na(seed.df$adjust.seed))]<-1
+  }
+  seed.df<-seed.df %>% mutate(seed.2=ceiling(seed.1*(1/adjust.seed)))
+  ## Write the seed size
+  write.csv(seed.df, paste0(f.out,"seed.df.csv"))
+}
+  
+# max new cases (could tune to the cluster?)
+max.samp<-500
+
+#upper limits of infections and diagnoses rel to max samp
+max.infect<-max.samp / p.caseperinfect / p.seqpercase
+max.diag<-max.samp/ p.seqpercase
+#consider delayed diagnoses in averted cases? Add 1 month (cite?)
+
+#OUTPUT sims into a list (across clusters) of lists of dfs (one df per sim)
+all.sims.out<-replicate(ncl, vector())
+all.re.out<-replicate(ncl, vector()) #list of Re in sims
+seedz<-c()
+
+for (j in 1:ncl){
+  set.seed(j)
+  
+  #prime the list of dfs
+  run.df<-replicate(n=n.runs, vector())
+  re.df<-replicate(n=n.runs,vector())
+
+  # my cluster
+  cl<-clust.unq[j]
+  
+  #initial seed of infectious cluster members
+  #seed.1 is the inital guess. seed.2 is adjusted
+  if(initialrun==TRUE) {seed<-seed.df$seed.1[seed.df$clusterID==cl]}
+  if(initialrun==FALSE) {seed<-seed.df$seed.2[seed.df$clusterID==cl]}
+
+  #minimum of 1 seed
+  if(seed==0){seed<-1}
+  seedz<-c(seedz,seed)
+  
+  # Re through time subset from above
+  re.cl<-re.epoch %>% filter(clusterID==cl)
+  
+  for (i in 1:n.runs){
+    set.seed(i+69) #seed for random number generator
+    #initiate with seed form above
+    cases<-seed
+    t<-rep(0, seed)  
+    times<-t #times/dates of infection
+    res<-c() #re values over time
+    reldayz<-c() #relative days when re looked up
+    relday<-dayzero 
+    
+    #run until no more infected, more than max samp 500 (filter below), or at end date max long:
+    while(cases > 0 & length(times)<max.infect & max(times)<max.long) { 
+      
+      #lookup epochal Re
+      r.og<-r.now<-re.cl$Re[which(re.cl$date_start==(relday+1))]
+      if(is.na(r.now)){r.now<-default.re} #default receding, shouldnt have to use this
+
+      #for X% of generations, walk away from the epochal mean
+      flip<-rbinom(1,1,0.6)
+
+      ## according to gamma dist centered on epochal mean
+      if(flip==1){
+        r.z<-gammaParamsConvert(mean=r.now, sd=0.4)
+        r.shape.now<-r.z$shape
+        r.scale.now<-r.z$scale
+        r.now<-rgamma(1, shape=r.shape.now, scale=r.scale.now)
+      }
+      #variability in dispersion
+      k.now<-runif(n = 1, min = k.min, max=k.max)
+      
+      #variability in serial interval params
+      si.shape.now<-runif(1, min = si.shape-0.01, max=si.shape+0.01)
+      si.rate.now<-runif(1, min = si.rate-0.01, max=si.rate+0.01)
+       
+      # vector of the number of secondary cases infected by each infected case
+      secondary<-rnbinom(cases, size= k.now, mu=r.now) 
+      t.new<- numeric() 
+      for(k in 1:length(secondary)) { 
+        t.new<-c(t.new, t[k] + 
+                   rgamma(secondary[k], shape=si.shape.now, rate=si.rate.now) )
+      }
+  
+      #average time since origin of those infected. Use to lookup Re for next generation.
+      relday<-round(mean(t.new))+dayzero # a date
+      reldayz<-c(reldayz,relday)
+      
+      #number of actively infected cases
+      cases<-length(t.new) 
+      
+      #t.new is a vector of infection times relative to beginning of simulation in this generation
+      t<-t.new 
+      times<-c(times,t.new) 
+      res<-c(res,r.now) #only run if interested
+    } #end of while loop
+    
+    #remove times that are greater than max (forward looking si)
+    xs.times<-which(times>max.long)
+    if(length(xs.times)>0){times<-times[-xs.times]}
+    
+    run.df[[i]]<-data.frame(order=1:length(times), infection.times=sort(times), run=i,
+                            ass.rate=NA, diagnosed=0, seq.rate=NA, sampled=0) #default not diagnosed or sampled
+    run.df[[i]]$clusterID<-cl
+    
+    re.df[[i]]<-data.frame(reldayz, Re=res)
+    # re.df$[[i]]$clusterID<-cl
+    
+    #draw an ascertainment rate (diagnosed cases per infected)
+    ass.rate<-rlnorm(1,mean=log(p.caseperinfect), sd=0.02)
+    if(ass.rate>0.99) {ass.rate<-0.99} #set max #needed if applying weights or wide sd
+    if(ass.rate<0.5) {ass.rate<-0.5} #set min
+  
+    #who was diagnosed in DTP?
+    run.df[[i]]$ass.rate<-ass.rate #log it
+    sz.inf<-nrow(run.df[[i]])  
+    run.df[[i]]$diagnosed<-rbinom(n=sz.inf, size=1, prob = ass.rate)
+    
+    #Reduce memory by only including those diagnosed (total infected irrelevant for analyses)
+    run.df[[i]]<-run.df[[i]] %>% filter(diagnosed==1)
+    
+    #who was sampled/sequenced given diagnosed?
+    sz.diag<-nrow(run.df[[i]])
+    
+    if(sz.diag>0){
+      seq.rate<-rlnorm(1,mean=log(p.seqpercase), sd=0.1)
+      if(seq.rate>0.99){seq.rate<-0.99} #impose a max
+      run.df[[i]]$seq.rate<-seq.rate
+      run.df[[i]]$sampled<-rbinom(n=sz.diag, size=1, prob = seq.rate)
+    }
+  } #end of i loop of n runs for each cluster
+  
+  # export lists of dfs as elements of lists
+  all.sims.out[[j]]<-run.df
+  all.re.out[[j]]<-re.df
+  
+} #end of j loop across clust
+
+
+# For observed Re, back up
+if(type.re=="Re_observed"){all.sims.out.obs<-all.sims.out}
+```
+
+## Filter simulations
+```{r}
+#iterate through clusters to filter empty, too big, ...
+filter.simlist<-function(list){
+  for(j in 1:ncl){
+    ## remove empty elements inthe list (if memory limit exhausted, or stop early)
+    list[[j]]<-list_drop_empty(list[[j]]) #this also removes any with no diagnoses only infected
+    length(list[[j]])
+    all.re.out[[j]]<-list_drop_empty(all.re.out[[j]])
+    length(all.re.out[[j]])
+    
+    #Id and remove any simulations with these criteria
+    zers<-c()
+    highsamp<-c()
+    highinf<-c()
+    
+    #iterate across each simulation 
+    for (i in 1:length(list[[j]])){ 
+      #how many were sampled total in this sim
+      ll<-length(which(list[[j]][[i]]$sampled==1))
+      #with zero sampled
+      if(ll<1){
+        zers<-c(zers, i)
+      }
+      #no bigger n.sample than 1.1x biggest sublineage that was observed
+      if(ll>(max.samp*1.1)){
+        highsamp<-c(highsamp,i)
+      }
+      #total infected greater than max total.size (outbreak stopped short here)
+      ln<-nrow(list[[j]][[i]]) #nrow is one for every infected
+      if(ln>max.infect){
+        highinf<-c(highinf,i)
+      }
+    }
+    
+    length(zers) 
+    length(highsamp)
+    length(highinf)
+    
+    goners<-unique(c(zers,highsamp,highinf)) # 
+    length(goners)
+    
+    #remove i goners/sims
+    if(length(goners)>0){
+      list[[j]]<-list[[j]][-goners]
+    }
+    
+  } #end of loop  
+  return(list)
+}
+
+# all.sims.out.obs<-all.sims.out
+all.sims.out<-filter.simlist(all.sims.out)
+all.sims.out.obs<-filter.simlist(all.sims.out.obs)
+```
+
+## bind simulations by cluster ##
+```{r}
+run.df.all<-replicate(ncl, vector())
+run.df.summ<-replicate(ncl, vector())
+
+for (j in 1:ncl){
+  #run.df.all is every case in every simulation
+  run.df.all[[j]]<-dplyr::bind_rows(all.sims.out[[j]])
+  
+  #run.df.summ is one row per simulation run
+  run.df.summ[[j]]<-run.df.all[[j]] %>% dplyr::group_by(run) %>%
+    dplyr::summarize(clusterID=clusterID[1],
+                     n=n(),
+                     n.diag=length(which(diagnosed==1)),
+                     n.sample=length(which(sampled==1)),
+                     max.time=max(infection.times))
+}
+
+#observed sims
+run.df.all.obs<-replicate(ncl, vector())
+run.df.summ.obs<-replicate(ncl, vector())
+
+for (j in 1:ncl){
+  #run.df.all is every case in every simulation
+  run.df.all.obs[[j]]<-dplyr::bind_rows(all.sims.out.obs[[j]])
+  
+  #run.df.summ is one row per simulation run
+  run.df.summ.obs[[j]]<-run.df.all.obs[[j]] %>% dplyr::group_by(run) %>%
+    dplyr::summarize(clusterID=clusterID[1],
+                     n=n(),
+                     n.diag=length(which(diagnosed==1)),
+                     n.sample=length(which(sampled==1)),
+                     max.time=max(infection.times))
+}
+
+#no PrEP fit
+run.df.summ.big<-bind_rows(run.df.summ)
+#observed/PrEP fit
+run.df.summ.big.obs<-bind_rows(run.df.summ.obs)
+```
+
+
+## Make a plot of N diag predicted and observed, facetted by cluster
+```{r}
+# Add mean n case
+run.df.summ.big.summ<-run.df.summ.big %>% 
+  # filter(clusterID %in% med.active.clust)%>%
+  group_by(clusterID)%>%
+  dplyr::summarize(mean.diag=round(mean(n.diag, na.rm=T)),
+                   #quantiles for CI isn't right...
+                   upper.diag=round(quantile(n.diag,0.95, na.rm=T)),
+                   lower.diag=round(quantile(n.diag,0.05, na.rm=T)) )
+
+# Add bootstrap CIs (resample 95% of data, calculate and track mean, repeat X times, then calc regular CI)
+n.boot<-999
+getmean <- function(data, indices) {
+  d <- data[indices,] 
+  return(mean(d$n.diag,na.rm=T))
+}
+df.boot<-data.frame(clusterID=clust.unq, mean=NA, upper=NA, lower=NA)
+for (i in 1:ncl){
+  df<-run.df.summ.big %>% filter(clusterID == clust.unq[i])
+    boot.1<-boot(df, statistic=getmean, R = 1000)
+  b<-boot.ci(boot.1,conf = 0.95,type = "norm") %>% unlist()
+  df.boot$mean[df.boot$clusterID == clust.unq[i]]<-b$t0 %>% round(digits = 1)
+  df.boot$upper[df.boot$clusterID == clust.unq[i]]<-b$normal3 %>% round(digits = 1)
+  df.boot$lower[df.boot$clusterID == clust.unq[i]]<-b$normal2 %>% round(digits = 1)
+}
+
+#join on to the run.df.summ.big.summ
+run.df.summ.big.summ<-run.df.summ.big.summ %>% left_join(df.boot, by="clusterID")
+head(run.df.summ.big.summ)
+
+#text that combines mean and confints
+run.df.summ.big.summ<-run.df.summ.big.summ %>% 
+  unite(col=ci, lower, upper, sep = "-", remove = F) %>%
+  unite(col=text, mean, ci, sep = " (", remove = F)
+run.df.summ.big.summ$text<-paste0(run.df.summ.big.summ$text,")")
+
+run.df.summ.big.summ.medact<-run.df.summ.big.summ %>% 
+  filter(clusterID %in% med.active.clust) 
+# run.df.summ.big.summ.medact.obs<-run.df.summ.big.summ.obs %>% 
+#   filter(clusterID %in% med.active.clust) 
+
+if(type.re=="Re_observed"){
+  plotcolor<-prepcolz[1]
+  textlabel<-"PrEP (sim.): "
+}
+if(type.re!="Re_observed"){
+  plotcolor<-prepcolz[2]
+  textlabel<-"no PrEP (sim.): "
+}
+
+# Plot of predicted distrib with observed line, both annotated
+#PLOT
+P3.bar.sim.diag.f<-run.df.summ.big %>% 
+  filter(clusterID %in% med.active.clust) %>%
+    ggplot()+
+     
+    geom_bar(aes(x=n.diag),stat="count", fill=plotcolor, alpha=0.8)+
+    geom_vline(data=run.df.summ.big.summ.medact, 
+               aes(xintercept = mean.diag, group=clusterID), color=plotcolor,linetype=6)+
+    geom_text(data=run.df.summ.big.summ.medact, aes(x = mean.diag, y=1,group=clusterID,
+                                             label=paste0(textlabel, text)),
+              color=plotcolor,size=2.4,vjust=-3,hjust=-0.05)+
+
+    #add a line for the observed value in different colour
+    geom_vline(data=clust.obs.cum.medact, aes(xintercept = total.observed, group=clusterID), color = prepcolz[1],linetype=6)+
+    geom_text(data=clust.obs.cum.medact, aes(x = total.observed,  y=1,group=clusterID, 
+                                             label=paste0("PrEP (obs.): ",ceiling(total.observed))),
+              color=prepcolz[1],size=2.4,vjust=-1,hjust=-0.05)+
+  
+    pubTheme+
+    scale_x_continuous(expand=expansion(mult=c(0,1)))+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,vjust=1,hjust=1,size=rel(1.2)),
+          # legend.position = c(0.7,0.8),
+          legend.position = "none",
+          legend.text = element_text(size=9),
+          # axis.title.y=element_text(vjust=4),       
+          axis.title.y=element_text(vjust=1,size=rel(1.2)), 
+          plot.margin=unit(c(4,4,4,4),"pt"))+
+    labs(x="n diagnosed",y="Count")+
+    guides(fill=guide_legend(ncol= 1,title="Lineage",title.position="top",reverse = T, keywidth = 1.2,keyheight = 1.2))+
+  facet_wrap(~clusterID, scales="free",nrow=6)
+
+P3.bar.sim.diag.f
+ggsave(paste0(f.out, type.re, "_simulations_Ndiag.png"), width = 8.5,height=7)
+```
+
+## Repeat for all clustres, not just active med
+```{r}
+
+# Plot of predicted distrib with observed line, both annotated
+#PLOT
+P3.bar.sim.diag.f.mo<-run.df.summ.big %>% 
+    ggplot()+
+    geom_bar(aes(x=n.diag),stat="count", fill=plotcolor, alpha=0.8)+
+    geom_vline(data=run.df.summ.big.summ, 
+               aes(xintercept = mean.diag, group=clusterID), color=plotcolor,linetype=6)+
+    geom_text(data=run.df.summ.big.summ, aes(x = mean.diag, y=1,group=clusterID,
+                                             label=paste0(textlabel, text)),
+              color=plotcolor,size=2.4,vjust=-3,hjust=-0.05)+
+
+    #add a line for the observed value in different colour
+    geom_vline(data=clust.obs.cum, aes(xintercept = total.observed, group=clusterID), color = prepcolz[1],linetype=6)+
+    geom_text(data=clust.obs.cum, aes(x = total.observed,  y=1,group=clusterID, 
+                                             label=paste0("PrEP (obs.): ",ceiling(total.observed))),
+              color=prepcolz[1],size=2.4,vjust=-1,hjust=-0.05)+
+  
+    pubTheme+
+    scale_x_continuous(expand=expansion(mult=c(0,1)))+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,vjust=1,hjust=1,size=rel(1.2)),
+          # legend.position = c(0.7,0.8),
+          legend.position = "none",
+          legend.text = element_text(size=9),
+          # axis.title.y=element_text(vjust=4),       
+          axis.title.y=element_text(vjust=1,size=rel(1.2)), 
+          plot.margin=unit(c(4,4,4,4),"pt"))+
+    labs(x="n diagnosed",y="Count")+
+    guides(fill=guide_legend(ncol= 1,title="Lineage",title.position="top",reverse = T, keywidth = 1.2,keyheight = 1.2))+
+  facet_wrap(~clusterID, scales="free")
+
+P3.bar.sim.diag.f.mo
+ggsave(paste0(f.out, type.re, "_simulations_Ndiag_mo.png"), width = 12,height=15)
+```
+
+# Repeat for samples (apples to apples b/c cluster members are diagnosed and sequenced)
+```{r}
+# Add median n case
+run.df.summ.big.summ.samp<-run.df.summ.big %>% 
+  # filter(clusterID %in% med.active.clust)%>%
+  group_by(clusterID)%>%
+  dplyr::summarize(mean.sample=round(mean(n.sample, na.rm=T)),
+                   upper.sample=round(quantile(n.sample,0.95, na.rm=T)),
+                   lower.sample=round(quantile(n.sample,0.05, na.rm=T)) )
+
+# Add bootstrap CIs (resample 95% of data, calculate and track mean, repeat X times, then calc regular CI)
+n.boot<-999
+getmean.samp <- function(data, indices) {
+  d <- data[indices,] 
+  return(mean(d$n.sample,na.rm=T)) }
+df.boot<-data.frame(clusterID=clust.unq, mean=NA, upper=NA, lower=NA)
+for (i in 1:ncl){
+  df<-run.df.summ.big%>% filter(clusterID == clust.unq[i])
+    boot.1<-boot(df, statistic=getmean.samp, R = 1000)
+  b<-boot.ci(boot.1,conf = 0.95,type = "norm") %>% unlist()
+  df.boot$mean[df.boot$clusterID == clust.unq[i]]<-b$t0 %>% round(digits = 1)
+  df.boot$upper[df.boot$clusterID == clust.unq[i]]<-b$normal3 %>% round(digits = 1)
+  df.boot$lower[df.boot$clusterID == clust.unq[i]]<-b$normal2 %>% round(digits = 1)
+}
+
+#join on to the run.df.summ.big.summ
+run.df.summ.big.summ.samp<-run.df.summ.big.summ.samp %>% left_join(df.boot, by="clusterID")
+
+#text that combines mean and confints
+run.df.summ.big.summ.samp<-run.df.summ.big.summ.samp %>% 
+  unite(col=ci, lower, upper, sep = "-", remove = F) %>%
+  unite(col=text, mean, ci, sep = " (", remove = F)
+run.df.summ.big.summ.samp$text<-paste0(run.df.summ.big.summ.samp$text,")")
+
+# Plot of predicted distrib with observed line, both annotated
+run.df.summ.big.summ.samp.medact<-run.df.summ.big.summ.samp %>%
+  filter(clusterID %in% med.active.clust)
+# run.df.summ.big.summ.samp.medact.obs<-run.df.summ.big.summ.samp.obs %>%
+#   filter(clusterID %in% med.active.clust)
+
+#PLOT
+P3.bar.sim.sample.f.samp<-run.df.summ.big %>% 
+  filter(clusterID %in% med.active.clust) %>%
+    ggplot()+
+    geom_bar(aes(x=n.sample),stat="count", fill=plotcolor, alpha=0.8)+
+    geom_vline(data=run.df.summ.big.summ.samp.medact, 
+               aes(xintercept = mean.sample, group=clusterID), color=plotcolor,linetype=6)+
+    geom_text(data=run.df.summ.big.summ.samp.medact, 
+              aes(x = mean.sample, y=1,group=clusterID,
+                                             label=paste0(textlabel,text)),
+              color=plotcolor,size=2.4,vjust=-3,hjust=-0.05)+
+ 
+    #add a line for the observed value in different colour
+    geom_vline(data=clust.obs.cum.medact, aes(xintercept = total.observed, group=clusterID), color = prepcolz[1],linetype=6)+
+    geom_text(data=clust.obs.cum.medact, aes(x = total.observed,  y=1,group=clusterID, 
+                                             label=paste0("PrEP (obs.): ",ceiling(total.observed))),
+              color=prepcolz[1],size=2.4,vjust=-1,hjust=-0.05)+
+
+    pubTheme+
+    scale_x_continuous(expand=expansion(mult=c(0,1)))+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,vjust=1,hjust=1,size=rel(1.2)),
+          # legend.position = c(0.7,0.8),
+          legend.position = "none",
+          legend.text = element_text(size=9),
+          # axis.title.y=element_text(vjust=4),       
+          axis.title.y=element_text(vjust=1,size=rel(1.2)), 
+          plot.margin=unit(c(4,4,4,4),"pt"))+
+    labs(x="n sampled",y="Count")+
+    # guides(fill=guide_legend(ncol= 1,title="Lineage",title.position="top",reverse = T, keywidth = 1.2,keyheight = 1.2))+
+  facet_wrap(~clusterID, scales="free",nrow=6)
+
+P3.bar.sim.sample.f.samp
+ggsave(paste0(f.out, type.re, "_simulations_Nsample.png"), width = 8.5,height=7)
+```
+
+## Seed adjustment
+## calculate diff between expected n sampled (using Re observed) and observed n case
+```{r}
+if(type.re=="Re_observed" & initialrun==TRUE){
+  seed.adjust<-left_join(clust.obs.cum, run.df.summ.big.summ.samp, by="clusterID")
+  seed.adjust<-seed.adjust %>% dplyr::select(clusterID, total.observed, mean.sample)
+  seed.adjust<-seed.adjust %>% mutate(adjust.seed=mean.sample/total.observed)
+  # if >1 then too big in sim; if <1, too small #mult by 1/adjust.seed
+  
+  #could also adjust Re by this value... but I think more likely related to misspecified seed
+  write.csv(seed.adjust,paste0(f.out, "seed.adjust.csv"))
+}
+
+```
+
+
+## Join simulated PrEP and no PREP to calculate cases (samples and diagnoses) averted
+```{r}
+colnames(clust.obs.cum)
+run.df.summ.big.obs.r<-run.df.summ.big.obs[,-c(3,6)]
+run.df.summ.big.r<-run.df.summ.big[,-c(3,6)]
+
+#add type 
+clust.obs.cum$type<-"PrEP_obs"
+run.df.summ.big.obs.r$type<-"PrEP_sim"
+run.df.summ.big.r$type<-"NoPrEP_sim"
+
+#bind rows
+run.df.summ.big.both.long<-bind_rows(run.df.summ.big.r, run.df.summ.big.obs.r)
+
+
+# #join by cluster ID (and run?)
+# run.df.summ.big.both<-left_join(run.df.summ.big.r, run.df.summ.big.obs.r, by=c("clusterID","run"))
+# colnames(run.df.summ.big.both)
+
+# #make long
+# run.df.summ.big.both.long<-run.df.summ.big.both %>%
+#   pivot_longer(cols = )
+
+temp<-run.df.summ.big.both.long %>%
+  # filter(clusterID %in% med.active.clust) %>%
+  dplyr::group_by(clusterID, type) %>%
+  dplyr::summarise(clusterID=clusterID[1],
+                   type=type[1],
+                   mean=mean(log(n.diag)))
+
+# #SORT these in order of most averted like the other plot
+run.df.summ.big.both.long$clusterID<-factor(run.df.summ.big.both.long$clusterID, levels=clust.ord2)
+temp$clusterID<-factor(temp$clusterID, levels = clust.ord2)
+run.df.summ.big.both.long$type2<-str_replace_all(run.df.summ.big.both.long$type, c("NoPrEP_sim"="No PrEP",
+                                                                                   "PrEP_sim"="PrEP since 2018"))
+temp$type2<-str_replace_all(temp$type, c("NoPrEP_sim"="No PrEP","PrEP_sim"="PrEP since 2018"))
+  
+#Plot the distrib diagnoses in either by cluster
+p.sims<-run.df.summ.big.both.long %>%
+  # filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_boxplot(aes(x=as.factor(clusterID), y=log(n.diag), color=type2),
+             position = position_dodge(width=0.8),
+             width=0.5,alpha=0.4,outlier.alpha = 0.1, fatten=NULL,size=0.4,outlier.size=0.4)+
+  geom_point(data=temp, aes(x=as.factor(clusterID), y=mean, color=type2),position = position_dodge(width=0.8),shape="-",size=4)+
+  pubTheme+
+  theme(legend.position = c(0.35,1), legend.justification = c(0.5,1),
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  scale_color_manual(values=rev(as.character(prepcolz)))+
+  guides(color=guide_legend(title="Simulation scenario"))+
+  labs(x="Cluster", y="log N diagnosed")+
+  scale_y_continuous(expand=c(0.1,0), limits = c(0,8))
+p.sims
+ggsave(paste0(f.out,"Simulated_PrEP-NoPrEP_Log-NDiag.png"),width=8.5,height=5)
+# 
+# 
+# #Now samples
+# run.df.summ.big.both.long %>%
+#   filter(clusterID %in% med.active.clust) %>%
+#   ggplot()+
+#   geom_boxplot(aes(x=as.factor(clusterID), y=n.sample, color=type),
+#              position = position_dodge(width=0.8),
+#              width=0.5,alpha=0.4)+
+#   pubTheme+
+#   theme(legend.position = c(0.9,0.95), legend.justification = c(1,1))+
+#   scale_color_manual(values=rev(as.character(prepcolz)))+
+#   labs(x="Cluster", y="N sampled")
+# ggsave(paste0(f.out,"Simulated_PrEP-NoPrEP_NSamp.png"),width=8.5,height=4.5)
+
+```
+
+## Calculate samples and diagnoses averted 
+```{r}
+## Create summary objects for the obs data
+run.df.summ.big.summ.obs<-run.df.summ.big.obs %>% 
+  group_by(clusterID)%>%
+  dplyr::summarize(mean.diag=round(mean(n.diag, na.rm=T)),
+                   upper.diag=round(quantile(n.diag,0.95, na.rm=T)),
+                   lower.diag=round(quantile(n.diag,0.05, na.rm=T)) )
+
+# Add bootstrap CIs (resample 95% of data, calculate and track mean, repeat X times, then calc regular CI)
+df.boot<-data.frame(clusterID=clust.unq, mean=NA, upper=NA, lower=NA)
+for (i in 1:ncl){
+  df<-run.df.summ.big.obs %>% filter(clusterID == clust.unq[i])
+    boot.1<-boot(df, statistic=getmean, R = 1000)
+  b<-boot.ci(boot.1,conf = 0.95,type = "norm") %>% unlist()
+  df.boot$mean[df.boot$clusterID == clust.unq[i]]<-b$t0 %>% round(digits = 1)
+  df.boot$upper[df.boot$clusterID == clust.unq[i]]<-b$normal3 %>% round(digits = 1)
+  df.boot$lower[df.boot$clusterID == clust.unq[i]]<-b$normal2 %>% round(digits = 1)
+}
+
+#join on to the run.df.summ.big.summ
+run.df.summ.big.summ.obs<-run.df.summ.big.summ.obs %>% left_join(df.boot, by="clusterID")
+
+#text that combines mean and confints
+run.df.summ.big.summ.obs<-run.df.summ.big.summ.obs %>% 
+  unite(col=ci, lower, upper, sep = "-", remove = F) %>%
+  unite(col=text, mean, ci, sep = " (", remove = F)
+run.df.summ.big.summ.obs$text<-paste0(run.df.summ.big.summ.obs$text,")")
+# head(run.df.summ.big.summ.obs)
+
+# Add mean n case
+run.df.summ.big.summ.samp.obs<-run.df.summ.big.obs %>% 
+  group_by(clusterID)%>%
+  dplyr::summarize(mean.sample=round(mean(n.sample, na.rm=T)),
+                   upper.sample=round(quantile(n.sample,0.95, na.rm=T)),
+                   lower.sample=round(quantile(n.sample,0.05, na.rm=T)) )
+
+# Add bootstrap CIs (resample 95% of data, calculate and track mean, repeat X times, then calc regular CI)
+df.boot<-data.frame(clusterID=clust.unq, mean=NA, upper=NA, lower=NA)
+for (i in 1:ncl){
+  df<-run.df.summ.big.obs%>% filter(clusterID == clust.unq[i])
+    boot.1<-boot(df, statistic=getmean.samp, R = 1000)
+  b<-boot.ci(boot.1,conf = 0.95,type = "norm") %>% unlist()
+  df.boot$mean[df.boot$clusterID == clust.unq[i]]<-b$t0 %>% round(digits = 1)
+  df.boot$upper[df.boot$clusterID == clust.unq[i]]<-b$normal3 %>% round(digits = 1)
+  df.boot$lower[df.boot$clusterID == clust.unq[i]]<-b$normal2 %>% round(digits = 1)
+}
+
+#join on to the run.df.summ.big.summ
+run.df.summ.big.summ.samp.obs<-run.df.summ.big.summ.samp.obs %>% left_join(df.boot, by="clusterID")
+
+#text that combines mean and confints
+run.df.summ.big.summ.samp.obs<-run.df.summ.big.summ.samp.obs %>% 
+  unite(col=ci, lower, upper, sep = "-", remove = F) %>%
+  unite(col=text, mean, ci, sep = " (", remove = F)
+run.df.summ.big.summ.samp.obs$text<-paste0(run.df.summ.big.summ.samp.obs$text,")")
+
+
+## COMBINE
+samp.prepsim.summ<-run.df.summ.big.summ.samp.obs
+samp.noprepsim.summ<-run.df.summ.big.summ.samp
+
+colnames(samp.prepsim.summ)[-1]<-paste0(colnames(samp.prepsim.summ)[-1], "_prepsim")
+colnames(samp.noprepsim.summ)[-1]<-paste0(colnames(samp.noprepsim.summ)[-1], "_noprepsim")
+
+#JOIN EM
+run.df.summ.big.both.samp<-left_join(samp.prepsim.summ, samp.noprepsim.summ, by=c("clusterID"))
+
+# Calculate total samples averted (relative to the simulated data fitted to observed)
+run.df.summ.big.both.samp<-run.df.summ.big.both.samp %>%
+  mutate(mean.sample.averted =  mean_noprepsim - mean_prepsim, 
+         lower.sample.averted = lower_noprepsim - lower_prepsim  ,
+         upper.sample.averted = upper_noprepsim- upper_prepsim  )
+# run.df.summ.big.both.samp$mean.sample.averted
+
+#Join cluster comp on 
+run.df.summ.big.both.samp.2<-run.df.summ.big.both.samp %>% left_join (clust.comp, by="clusterID")
+
+clust.ord1 <- run.df.summ.big.both.samp.2$clusterID [order(run.df.summ.big.both.samp.2$mean.sample.averted,decreasing = T)]
+run.df.summ.big.both.samp.2$clusterID<-factor(run.df.summ.big.both.samp.2$clusterID, levels=clust.ord1)
+#Make plot with ranges for each
+yrange<-c(-20,30)
+
+##PLOT THIS
+run.df.summ.big.both.samp.2%>%
+  filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_bar(aes(x=as.factor(clusterID), y=mean.sample.averted, fill=risk), stat="identity",alpha=0.7)+
+  geom_errorbar(aes(x=as.factor(clusterID), ymin=lower.sample.averted, ymax=upper.sample.averted, color=risk), 
+                alpha=0.7, width = 0.3)+
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  scale_color_manual(values=riskcolz,guide="none")+
+  labs(x="Active clusters",y="Samples averted (sim. no PreP - sim. with PrEP)")+
+  guides(fill=guide_legend(title="Predominant population"))+
+  theme(legend.position = c(0.95,0.95), legend.justification = c(1,1),
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1)
+        )+
+  scale_y_continuous(breaks=seq(yrange[1],yrange[2],10),expand=c(0.1,0))+
+  coord_cartesian(ylim=yrange)
+ggsave(paste0(f.out,"/SamplesAvertedByRiskGrp.png"),width=8,height=4)
+
+## Repeat for diagnoses
+diag.prepsim.summ<-run.df.summ.big.summ.obs
+diag.noprepsim.summ<-run.df.summ.big.summ
+
+colnames(diag.prepsim.summ)[-1]<-paste0(colnames(diag.prepsim.summ)[-1], "_prepsim")
+colnames(diag.noprepsim.summ)[-1]<-paste0(colnames(diag.noprepsim.summ)[-1], "_noprepsim")
+
+#JOIN EM
+run.df.summ.big.both.diag<-left_join(diag.prepsim.summ, diag.noprepsim.summ, by=c("clusterID"))
+
+# Calculate total Diagnoses averted (relative to the simulated data fitted to observed)
+run.df.summ.big.both.diag<-run.df.summ.big.both.diag %>%
+  mutate(mean.diag.averted = mean_noprepsim- mean_prepsim, 
+         lower.diag.averted =lower_noprepsim - lower_prepsim  ,
+         upper.diag.averted = upper_noprepsim-upper_prepsim)
+run.df.summ.big.both.diag$mean.diag.averted
+
+#Join cluster comp on 
+run.df.summ.big.both.diag.2<-run.df.summ.big.both.diag %>% left_join (clust.comp, by="clusterID")
+
+#Make plot with ranges for each
+yrange<-c(-21,30)
+
+#new cluster order highest to lowest
+clust.ord2 <- run.df.summ.big.both.diag.2$clusterID [order(run.df.summ.big.both.diag.2$mean.diag.averted,decreasing = T)]
+run.df.summ.big.both.diag.2$clusterID<-factor(run.df.summ.big.both.diag.2$clusterID, levels=clust.ord2)
+
+##PLOT THIS
+p.averted<-run.df.summ.big.both.diag.2%>%
+  # filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_bar(aes(x=as.factor(clusterID), y=mean.diag.averted, fill=risk), stat="identity",alpha=0.7)+
+  geom_errorbar(aes(x=as.factor(clusterID), ymin=lower.diag.averted, ymax=upper.diag.averted, color=risk), 
+                alpha=0.7, width = 0.3)+
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  scale_color_manual(values=riskcolz,guide="none")+
+  labs(x="Cluster",y="Diagnoses averted by PrEP")+
+  guides(fill=guide_legend(title="Predominant population"))+
+  theme(legend.position = c(0.35,1), legend.justification = c(0.5,1),
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1)
+        )+
+  scale_y_continuous(breaks=seq(yrange[1],yrange[2],10),expand=c(0.01,0))+
+  coord_cartesian(ylim=yrange)
+p.averted
+
+ggsave(paste0(f.out,"/DiagnosesAvertedByRiskGrp.png"),width=8.5,height=4)
+
+```
+
+
+## grob this together with diag averted across sims
+```{r}
+p.sims.nox<-p.sims+theme(axis.title.x=element_blank())
+pz<-plot_grid(p.sims.nox,p.averted, labels=c("A","B"), align="v",nrow=2)
+pz
+ggsave(paste0(f.out, "SimulationsScenarios_DiagAverted.png"),width=9, height=6)
+```
+
+## cor?
+```{r}
+p.averted.age<-run.df.summ.big.both.diag.2%>%
+  filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_point(aes(x=as.factor(clusterID), y=mean.diag.averted, fill=risk), stat="identity",alpha=0.7)+
+  
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  scale_color_manual(values=riskcolz,guide="none")+
+  labs(x="Cluster",y="Diagnoses averted by PrEP")+
+  guides(fill=guide_legend(title="Predominant population"))+
+  theme(legend.position = c(0.4,0.999), legend.justification = c(0.5,1),
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1)
+        )+
+  scale_y_continuous(breaks=seq(yrange[1],yrange[2],10),expand=c(0.1,0))+
+  coord_cartesian(ylim=yrange)
+p.averted
+```
+
+
+# data queries
+```{r}
+#clusters with most averted diagnoses
+run.df.summ.big.both.diag.2$clusterID[run.df.summ.big.both.diag.2$mean.diag.averted>0]
+run.df.summ.big.both.diag.2$clusterID[order(run.df.summ.big.both.diag.2$mean.diag.averted, decreasing = T)]
+run.df.summ.big.both.diag.2$clusterID[which(run.df.summ.big.both.diag.2$mean.diag.averted>=1)]
+
+# If we assume no negative cases averted...how many total averted diagnoses
+total.diag.averted<-run.df.summ.big.both.diag.2 %>%
+  filter(mean.diag.averted>0)%>%
+  dplyr::summarise(sumdiagavert=sum(mean.diag.averted),
+                   sumdiagavert.low=sum(lower.diag.averted),
+                   sumdiagavert.up=sum(upper.diag.averted))
+total.diag.averted$sumdiagavert #107.6
+total.diag.averted$sumdiagavert.low #99.1
+total.diag.averted$sumdiagavert.up #115.7
+
+#diagnoses averted per year from 2018 to 2022
+total.diag.averted$sumdiagavert/max.long*365 #21.52
+total.diag.averted$sumdiagavert.low/max.long*365 #19.8
+total.diag.averted$sumdiagavert.up/max.long*365 #23.1
+
+# If we assume no negative cases averted...how many total averted samples
+total.samp.averted<-run.df.summ.big.both.samp.2 %>%
+  filter(mean.sample.averted>0)%>%
+  dplyr::summarise(sumsampavert=sum(mean.sample.averted),
+                   sumsampavert.low=sum(lower.sample.averted),
+                   sumsampavert.up=sum(upper.sample.averted))
+total.samp.averted$sumsampavert #98.2
+total.samp.averted$sumsampavert.low #91.4
+total.samp.averted$sumsampavert.up #106.7
+
+#diagnoses averted per year from 2018 to 2022
+total.samp.averted$sumsampavert/max.long*365 #19.8
+total.samp.averted$sumsampavert.low/max.long*365 #18.3
+total.samp.averted$sumsampavert.up/max.long*365 #21.3
+
+## Key clusters
+#CLUSTER 22
+run.df.summ.big.both.diag.2$medianAge2023 [run.df.summ.big.both.diag.2$clusterID==22] # 44.3
+run.df.summ.big.both.diag.2$medianAgeFARV [run.df.summ.big.both.diag.2$clusterID==22] # 39
+run.df.summ.big.both.diag.2$perc_MSM [run.df.summ.big.both.diag.2$clusterID==22] # 100
+run.df.summ.big.both.diag.2$perc_HA_Van [run.df.summ.big.both.diag.2$clusterID==22] # 73.6
+run.df.summ.big.both.diag.2$perc_PREP [run.df.summ.big.both.diag.2$clusterID==22] # 26.3
+run.df.summ.big.both.diag.2$n_seroconv_2018 [run.df.summ.big.both.diag.2$clusterID==22] # 19
+run.df.summ.big.both.diag.2$n_PREP [run.df.summ.big.both.diag.2$clusterID==22] # 5
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==22] # "49.9 (45.9-54.1)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==22] # "24 (21.7-26.4)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==22] # "25.9
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==22] # "24.2
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==22] # "27.7
+
+#CLUSTER 31
+run.df.summ.big.both.diag.2$medianAge2023 [run.df.summ.big.both.diag.2$clusterID==31] # 43.6
+run.df.summ.big.both.diag.2$medianAgeFARV [run.df.summ.big.both.diag.2$clusterID==31] # 35
+run.df.summ.big.both.diag.2$perc_MSM [run.df.summ.big.both.diag.2$clusterID==31] # 88.9
+run.df.summ.big.both.diag.2$perc_HA_Van [run.df.summ.big.both.diag.2$clusterID==31] # 60.5
+run.df.summ.big.both.diag.2$perc_PREP [run.df.summ.big.both.diag.2$clusterID==31] # 8.5
+run.df.summ.big.both.diag.2$n_seroconv_2018 [run.df.summ.big.both.diag.2$clusterID==31] # 94
+run.df.summ.big.both.diag.2$n_PREP [run.df.summ.big.both.diag.2$clusterID==31] #8
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==31] # "115.7 (112.3-119.1)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==31] #  "86.8 (84.2-89.4)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "28.9
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "28.1
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "29.7
+
+# 209 (PWID)
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==209] #  "13.4 (12-14.7)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==209] # "24 (21.7-26.4)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==209] # "25.9
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==209] # "24.2
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==209] # "27.7
+#31
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==31] # "115.7 (112.3-119.1)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==31] #  "86.8 (84.2-89.4)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "28.9
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "28.1
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==31] # "29.7
+
+#what are charactersitcs of negative cases averted 
+# 142, 234, and 13. 
+run.df.summ.big.both.diag.2$medianAge2023 [run.df.summ.big.both.diag.2$clusterID==142] #55
+run.df.summ.big.both.diag.2$medianAgeFARV [run.df.summ.big.both.diag.2$clusterID==142] #43
+run.df.summ.big.both.diag.2$perc_MSM [run.df.summ.big.both.diag.2$clusterID==142] # 75
+run.df.summ.big.both.diag.2$perc_HA_Van [run.df.summ.big.both.diag.2$clusterID==142] # 32.7
+run.df.summ.big.both.diag.2$perc_HA_VanIsl [run.df.summ.big.both.diag.2$clusterID==142] # 56.4
+run.df.summ.big.both.diag.2$perc_PREP [run.df.summ.big.both.diag.2$clusterID==142] # 0
+run.df.summ.big.both.diag.2$n_seroconv_2018 [run.df.summ.big.both.diag.2$clusterID==142] # 6
+
+run.df.summ.big.both.diag.2$medianAge2023 [run.df.summ.big.both.diag.2$clusterID==234] #44.3
+run.df.summ.big.both.diag.2$medianAgeFARV [run.df.summ.big.both.diag.2$clusterID==234] #33
+run.df.summ.big.both.diag.2$perc_MSM [run.df.summ.big.both.diag.2$clusterID==234] # 78.8
+run.df.summ.big.both.diag.2$perc_HA_Van [run.df.summ.big.both.diag.2$clusterID==234] # 30.8
+run.df.summ.big.both.diag.2$perc_HA_VanIsl [run.df.summ.big.both.diag.2$clusterID==234] # 12.8
+run.df.summ.big.both.diag.2$perc_PREP [run.df.summ.big.both.diag.2$clusterID==234] # 16.7
+run.df.summ.big.both.diag.2$n_seroconv_2018 [run.df.summ.big.both.diag.2$clusterID==234] # 6
+
+run.df.summ.big.both.diag.2$medianAge2023 [run.df.summ.big.both.diag.2$clusterID==13] #53.6
+run.df.summ.big.both.diag.2$medianAgeFARV [run.df.summ.big.both.diag.2$clusterID==13] #39
+run.df.summ.big.both.diag.2$perc_MSM [run.df.summ.big.both.diag.2$clusterID==13] # 88
+run.df.summ.big.both.diag.2$perc_HA_Van [run.df.summ.big.both.diag.2$clusterID==13] # 76.7
+run.df.summ.big.both.diag.2$perc_HA_VanIsl [run.df.summ.big.both.diag.2$clusterID==13] #6
+run.df.summ.big.both.diag.2$perc_PREP [run.df.summ.big.both.diag.2$clusterID==13] # 0
+run.df.summ.big.both.diag.2$n_seroconv_2018 [run.df.summ.big.both.diag.2$clusterID==13] # 3
+
+#cluster 33
+clust.comp[clust.comp$clusterID==33,]
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==33] # ""10.5 (9.5-11.4)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==33] #  ""4.6 (4.3-5)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==33] # "5.9
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==33] # "5.2
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==33] # "6.4
+
+#245
+clust.comp[clust.comp$clusterID==245,]
+run.df.summ.big.both.diag.2$text_noprepsim [run.df.summ.big.both.diag.2$clusterID==245] # "22.6 (20.3-24.9)"
+run.df.summ.big.both.diag.2$text_prepsim [run.df.summ.big.both.diag.2$clusterID==245] #  " "2.6 (2.4-2.8)"
+run.df.summ.big.both.diag.2$mean.diag.averted [run.df.summ.big.both.diag.2$clusterID==245] # 20
+run.df.summ.big.both.diag.2$lower.diag.averted [run.df.summ.big.both.diag.2$clusterID==245] #  17.9
+run.df.summ.big.both.diag.2$upper.diag.averted [run.df.summ.big.both.diag.2$clusterID==245] # 22.1
+
+```
+
+
+
+## Join estimated and observed total diagnosed cases to calculate averted by cluster
+```{r}
+# merge observed (raw n) with predicted (no prep) cases
+# run.df.summ.big2<-run.df.summ.big %>% left_join(clust.obs.cum, by=c("clusterID"))
+# # colnames(run.df.summ.big2)
+# 
+# #make long
+# run.df.summ.big2.long<-run.df.summ.big2 %>% pivot_longer(cols=c("n.sample","n.diag","total.observed"),
+#                                                         names_to = "metric",
+#                                                         values_to = "totaldiag")
+# 
+# #Merge in the simulated data fit to observed data (PrEP sim.)
+# 
+# #summarize total observed and predicted by cluster
+# run.df.summ.big2.long %>%
+#   filter(clusterID %in% med.active.clust) %>%
+#   ggplot()+
+#   geom_point(aes(x=as.factor(clusterID), group=metric, 
+#                y=totaldiag, color=metric), 
+#            position=position_dodge2(width=0.9),alpha=0.5,shape=18,size=1)+
+#   geom_point(aes(x=as.factor(clusterID), group=metric, 
+#                y=mean(totaldiag), color=metric), stat="identity",
+#              position=position_dodge2(width=0.9),shape=17,size=3, alpha=0.7)+
+#   pubTheme+
+#   theme(legend.position = "top")+
+#   labs(x=NULL,y="Total observed and predicted new diagnoses")
+# ggsave(paste0(f.out,"TotalCases_ObservedPred_byCluster.png"),height=6,width=8.5)
+# 
+# #Mutate cases averted daily
+# run.df.summ.big2<-run.df.summ.big2 %>% mutate(total.averted = n.diag - total.observed)
+# 
+# run.df.summ.big.avert<- run.df.summ.big2 %>% group_by(clusterID) %>%
+#   dplyr::summarise(cases.averted=mean(total.averted))
+# sum(run.df.summ.big.avert)
+# run.df.summ.big.avert$clusterID==9999
+# run.df.summ.big.avert[run.df.summ.big.avert$clusterID==9999,]
+```
+
+# MODELING FACTORS ASSOCIATED WITH CASES AVERTED
+
+## Poisson/NegBin model of cases averted in clusters: assoc with median age, % HA, % population
+```{r}
+#association with age?
+#cant have negatives for poisson
+obs.expect.all<-run.df.summ.big.both.diag.2 %>% 
+    filter(clusterID %in% active.clust)
+
+#join seed data for 2017 size
+seed.df$clusterID<-factor(seed.df$clusterID)
+obs.expect.all<-left_join(obs.expect.all, seed.df, by="clusterID")
+
+#change so refernce is pwid
+obs.expect.all$risk<-str_replace_all(obs.expect.all$risk, "PWID","A_PWID")
+# obs.expect.all$size2017
+# head(obs.expect.all)
+
+#Change negatives to zeroes
+obs.expect.all$cases.averted.z<-obs.expect.all$mean.diag.averted
+obs.expect.all$cases.averted.z[which(obs.expect.all$cases.averted.z<0)]<-0
+# hist(obs.expect.all$cases.averted.z)
+
+#instead of removing zeroes, normalize to the lowest value
+obs.expect.all$cases.averted<-obs.expect.all$mean.diag.averted
+min<--min(obs.expect.all$mean.diag.averted, na.rm = T)
+obs.expect.all$cases.averted<-round(obs.expect.all$cases.averted+min+1)
+# hist(obs.expect.all$cases.averted)
+
+#distribution of values
+hist(obs.expect.all$cases.averted)
+mean(obs.expect.all$cases.averted)
+var(obs.expect.all$cases.averted)
+#negbinomial because overdispersed
+
+#Join cluster composition data
+# clust.comp$clusterID<-factor(clust.comp$clusterID)
+# obs.expect.all<-obs.expect.all %>% left_join(clust.comp, by="clusterID")
+
+#quick look
+obs.expect.all %>%
+  ggplot()+
+  geom_point(aes(y=cases.averted, x=log(size2017),color=risk))
+obs.expect.all %>%
+  ggplot()+
+  geom_point(aes(y=cases.averted, x=medianAge2023,color=risk))
+```
+
+## poisson
+```{r}
+#simple model
+mod.null<-glm(data= obs.expect.all, cases.averted ~ NULL, family = poisson(link = "log"),)
+
+mod0<-glm(data= obs.expect.all, cases.averted ~ log(size2017), family=poisson(link = "log"))
+summary(mod0)
+exp(confint(mod0))
+anova(mod.null,mod0,test="LRT") #YES
+
+mod<-glm(data= obs.expect.all, cases.averted ~ log(size2017) +perc_MSM, family=poisson(link = "log"))
+summary(mod)
+exp(mod$coefficients)
+exp(confint(mod))
+anova(mod0,mod,test="LRT") #YES add perc MSM
+
+mod1<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023, family=poisson(link = "log"))
+summary(mod1)
+exp(mod$coefficients)
+exp(confint(mod))
+anova(mod,mod1,test="LRT") 
+
+#add ha in there?
+mod2<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023+perc_HA_Van, family=poisson(link = "log"))
+summary(mod2)
+exp(mod2$coefficients)
+anova(mod1,mod2,test="LRT")  #No add HA van
+
+#other HAs
+mod2.1<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023 + perc_HA_VanIsl, family=poisson(link = "log"))
+anova(mod2,mod2.1,test="LRT")  #NOPE
+mod2.2<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023+ perc_HA_Fras,family=poisson(link = "log"))
+anova(mod2,mod2.2,test="LRT")  #NOPE
+mod2.3<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023 + perc_HA_North,family=poisson(link = "log"))
+anova(mod2,mod2.3,test="LRT")  #NOPE
+
+#add prep in there?
+mod3<-glm(data= obs.expect.all, cases.averted ~ log(size2017)+perc_MSM+medianAge2023 + perc_PREP, family=poisson(link = "log"))
+anova(mod2,mod3,test="LRT")  #No to adding prep
+summary(mod3)
+exp(mod3$coefficients)
+exp(confint(mod3))
+
+#EXport a table
+finalmodel<-mod2
+pois<-exp(finalmodel$coefficients) %>% as.data.frame()
+pois$factor <-rownames(pois)
+colnames(pois)[1]<-"Mean"
+pois2<-exp(confint(finalmodel)) %>% as.data.frame()
+pois2$factor <-rownames(pois2)
+pois.mod<-left_join(pois, pois2)
+pois.mod<-pois.mod[,c(2,1,3,4)]
+pois.mod
+#pvals
+s<-summary(finalmodel)
+
+write.csv(pois.mod, paste0(f.out, "pois.mod.caseaverted.csv"))
+
+```
+
+## Build negative binom
+```{r}
+
+#simple model
+mod0<-glm.nb(data= obs.expect.all, cases.averted ~ size2017)
+summary(mod0)
+exp(confint(mod0))
+
+
+mod1<-glm.nb(data= obs.expect.all, cases.averted ~ size2017+ risk)
+summary(mod1)
+exp(confint(mod1))
+
+mod<-glm.nb(data= obs.expect.all, cases.averted ~ perc_MSM + medianAge2023)
+summary(mod)
+exp(mod$coefficients)
+exp(confint(mod))
+
+#add ha in there?
+mod2<-glm.nb(data= obs.expect.all, cases.averted ~ perc_MSM + medianAge2023+perc_PREP)
+summary(mod2)
+exp(mod2$coefficients)
+
+#add prep in there?
+mod3<-glm.nb(data= obs.expect.all, cases.averted ~ perc_MSM + medianAge2023+perc_HA_Van+perc_PREP)
+summary(mod3)
+exp(mod3$coefficients)
+exp(confint(mod3))
+
+# Repeat with the zero-adj instead of up to zero
+
+mod.z<-glm.nb(data= obs.expect.all, cases.averted.z ~ perc_MSM + medianAge2023)
+summary(mod.z)
+exp(mod.z$coefficients)
+exp(confint(mod.z))
+
+#add prep
+mod2.z<-glm.nb(data= obs.expect.all, cases.averted.z ~ perc_MSM + medianAge2023+perc_PREP)
+summary(mod2.z)
+
+#add prep in there?
+mod3.z<-glm.nb(data= obs.expect.all, cases.averted.z ~ perc_MSM + medianAge2023+perc_HA_Van+perc_PREP)
+summary(mod3.z)
+exp(mod3.z$coefficients)
+exp(confint(mod3.z))
+```
+
+## Plot cases averted across clusters
+```{r}
+clusterorder<-obs.expect.all$clusterID[obs.expect.all$active==1]
+obs.expect.all$clusterID<-factor(obs.expect.all$clusterID)
+
+##PLOT THIS
+obs.expect.all %>%
+  filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_bar(aes(x=clusterID, y=cases.averted, fill=risk), stat="identity",alpha=0.7)+
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  labs(x="Active clusters",y="Cases averted (observed - predicted stoch.)")+
+  guides(fill=guide_legend(title="Predominant population"))+
+  theme(legend.position = c(0.9,0.95), legend.justification = c(1,1),)+
+  scale_y_continuous(limits=c(0,50))
+        # axis.text.x=element_blank()
+        
+  # scale_y_continuous(breaks=seq(-15,80,5),expand=c(0.1,0))
+ggsave(paste0(f.out,"/CasesAvertedByRiskGrp.png"),width=6,height=3.5)
+
+```
+
+
+## EXTRAS
+
+## plots of outbreaks across clusters over time
+```{r}
+# run.df.all.big<-bind_rows(run.df.all)
+# run.df.all.big<-run.df.all.big %>% mutate(date = infection.times + dayzero)
+# 
+# po<-run.df.all.big%>%
+#   filter(clusterID %in% med.active.clust) %>%
+#   ggplot()+
+#   geom_bar(aes(x=as.Date(date), group=run, color=as.factor(clusterID)),alpha=0.2)+
+#   # scale_color_viridis_c(direction = -1)+
+#   pubTheme+
+#   # scaleDateFlex+
+#   labs(x="Date diagnosed", y="Density")+
+#   theme(legend.position = "none")+
+#   facet_wrap(~as.factor(clusterID),nrow=6)
+#   # coord_cartesian(xlim=as.Date(c("2020-12-01","2021-07-01")))
+# po
+# ggsave(paste0(f.out,"Density_Sims_DiagOverTime_clusters.png"),height=4,width=4)
+
+```
+
+#extra plots
+```{r}
+#summarize total averted by cluster
+# run.df.summ.big2 %>%
+#   filter(clusterID %in% med.active.clust) %>%
+#   ggplot()+
+#   geom_violin(aes(x=as.factor(clusterID), group=as.factor(clusterID), y=n.diag))+
+#   geom_col(aes(x=as.factor(clusterID), group=as.factor(clusterID),
+#                y=total.observed),alpha=0.2)+
+#   pubTheme+
+#   # theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+#   # theme(legend.position = "none")+
+#   labs(x=NULL,y="Total averted diagnoses")
+# ggsave(paste0(f.out,"BoxP_Dailycases_Averted.png"),height=6,width=7)
+
+# 
+# 
+# 
+# #Repeat but no stack, just a line and ribbon overlaid
+# y.lim2<-c(0,max(can.var.cases.red$mean.dailycase))
+# p.cases.obs.pred.rib<-ggplot()+
+#     annotate(geom="rect",xmin = as.Date(int.start), xmax = as.Date(int.end),
+#              ymin = y.lim2[1], ymax =y.lim2[2],
+#              color="grey85",size=0,  fill="grey80")+
+#     annotate(geom="text",x =( as.Date(int.start)+int.duration/2),
+#              y=(y.lim2[2]/100)*99, vjust=1, hjust=0.5,
+#              label=int.descrip,fontface="italic",color="grey25",size=3)+
+#     scale_fill_manual(values=pred.pal)+
+#     pubThemeDate+
+#     geom_bar(data=can.var.cases.red,
+#              aes(x=date, y=mean.dailycase, group=type), stat="identity",width=1)+
+#   geom_line(data=cases.mean.date, aes(x=date,y=mean.dailycase.diagnosed),alpha=0.3)+
+#   geom_ribbon(data=cases.mean.date, aes(x=date,ymin=lower.dailycase.diagnosed,
+#                                         ymax=upper.dailycase.diagnosed),alpha=0.3)+
+#     scaleDateFlexMoreButLess2+
+#     scale_y_continuous(expand=c(0,0))+
+#     # GlobFillScale+
+#     theme(legend.position = "top")+
+#     labs(x=NULL, y=paste0("Average daily diagnosed ",Focal.var," cases"))+
+#     coord_cartesian(ylim=y.lim2)
+#   
+# p.cases.obs.pred.rib
+# ggsave(paste0(f.out,"canada.var.cases.pred.obs_rib.png"),height=4,width=4,unit="in")
+# 
+# ## grobbed plot with overlaid possible simulations and then case incidence
+# plot_grid(p.sims, p.cases.obs.pred, labels=LETTERS[1:2], align="h",nrow=1)
+# ggsave(paste0(f.out,"Sims_ObsPredCases.png"), height=3.5,width=8)
+```
+
+
+## Export summarized simulation draws as text
+```{r}
+# #overall
+# 
+# #sampled cumulative 
+# n.cum<-c()
+# #max daily sampled
+# n.max.daily<-c()
+# #mean sampled outbreak size
+# mean.size<-c()
+# #max sampled outbreak size
+# max.size.s<-c()
+# 
+# #diagnosed cum
+# n.cum.diag<-c()
+# 
+# #max daily diagnosed, etc etc
+# n.max.daily.diag<-c()
+# mean.size.diag<-c()
+# max.size.diag<-c()
+# 
+# #all infected cum (ew)
+# n.cum.all<-c()
+# n.max.daily.all<-c()
+# mean.size.all<-c()
+# max.size.all<-c()
+# 
+# 
+# #for each draw
+# for (i in 1:length(draw.list)){
+#   
+#   draw.list[[i]]$date<-factor(draw.list[[i]]$date)
+# 
+#   temp<-draw.list[[i]] %>% dplyr::group_by(run) %>%
+#     dplyr::summarize(intro.date=intro.date[1],
+#                      n.all=n(),
+#                      n.diag=length(which(sampled==1)),
+#                      n.sample=length(which(sampled==1)),
+#                      max.time=max(infection.times))
+#   
+#   intro.n<-nrow(temp)
+#   per1.n<-length(which(temp$intro.date <= per1[2]))
+#   per2.n<-intro.n-per1.n
+#   sing<-length(which(temp$n.sample==1))
+#   max.l<-max(temp$max.time)
+#   median.l<-median(temp$max.time)
+# 
+#   #SSAMPLES
+#   temp2<-draw.list[[i]] %>% dplyr::group_by(date) %>% 
+#     dplyr::summarise(dailycase=sum(sampled))
+#   
+#   cum.s<-sum(temp2$dailycase)
+#   max.day.s<-max(temp2$dailycase)
+#   max.s<-max(temp$n.sample)
+#   mean.s<-mean(temp$n.sample)
+#   
+#   ## add to running vectors
+#   n.sing<-c(n.sing, sing)
+#   n.intro.per1<-c(n.intro.per1,per1.n)
+#   n.intro.per2<-c(n.intro.per2, per2.n)
+#   max.longs<-c(max.longs,max.l)
+#   med.longs<-c(med.longs,median.l)
+#   
+#   n.cum<-c(n.cum, cum.s)
+#   n.max.daily<-c(n.max.daily,max.day.s)
+#   mean.size<-c(mean.size,mean.s)
+#   max.size.s<-c(max.size.s,max.s)
+#   
+#   #repeat for all - these are currently same as diagnosed b/c undiagnosed removed for mem
+#   temp3<-draw.list[[i]] %>% dplyr::group_by(date) %>% 
+#     dplyr::summarise(dailycase=n())
+#   
+#   cum.all<-sum(temp3$dailycase)
+#   max.day.all<-max(temp3$dailycase)
+#   max.s.all<-max(temp$n.all)
+#   mean.s.all<-mean(temp$n.all)
+#   
+#   ## add to running vectors
+#   n.cum.all<-c(n.cum.all, cum.all)
+#   n.max.daily.all<-c(n.max.daily.all,max.day.all)
+#   mean.size.all<-c(mean.size.all,mean.s.all)
+#   max.size.all<-c(max.size.all,max.s.all)
+#   
+#   #repeat for diagnosed
+#   temp4<-draw.list[[i]] %>% dplyr::group_by(date) %>% 
+#     dplyr::summarise(dailycase=sum(diagnosed))
+#   
+#   cum.diag<-sum(temp4$dailycase)
+#   max.day.diag<-max(temp4$dailycase)
+#   max.s.diag<-max(temp$n.diag)
+#   mean.s.diag<-mean(temp$n.diag)
+#   
+#   #Day of max daily diag
+#   d.max.daily.diag<-as.Date(temp4$date[which(temp4$dailycase==max.day.diag)][1])
+#     
+#   #by period
+#   temp4.p1<-draw.list.summ[[i]] %>% filter(intro.date<=per1[2])
+#   cum.diag.p1<-sum(temp4.p1$n.diag,na.rm = T)
+#   temp4.p2<-draw.list.summ[[i]] %>% filter(intro.date>=per2[1])
+#   cum.diag.p2<-sum(temp4.p2$n.diag,na.rm = T)
+#   
+#   
+#   ## add to running vectors
+#   n.cum.diag<-c(n.cum.diag, cum.diag)
+#   n.max.daily.diag<-c(n.max.daily.diag,max.day.diag)
+#   mean.size.diag<-c(mean.size.diag,mean.s.diag)
+#   max.size.diag<-c(max.size.diag,max.s.diag)
+#   
+#   n.cum.diag.p1<-c(n.cum.diag.p1, cum.diag.p1)
+#   n.cum.diag.p2<-c(n.cum.diag.p2, cum.diag.p2)
+#   day.max.daily.diag<-c(day.max.daily.diag,  d.max.daily.diag)
+# }
+# 
+# ## add all of these in the text export
+# cat(paste0("SIMULATIONS overview",
+#             "\nMean # singletons sampled: ",mean.95ci.X(n.sing,0), 
+#             "\nMean intros period 1: ",mean.95ci.X(n.intro.per1,0),
+#             "\nMean intros period 2: ",mean.95ci.X(n.intro.per2,0), 
+#             "\nMax longevity: ",mean.95ci.X(max.longs,0), 
+#             "\nMedian longevity: ",mean.95ci.X(med.longs,0), 
+#            
+#             "\nMean cumulative sampled cases: ",mean.95ci.X(n.cum,0), 
+#             "\nMax daily sampled cases: ",mean.95ci.X(n.max.daily,0), 
+#             "\nMean intro sampled size: ",mean.95ci.X(mean.size,0), 
+#             "\nMax intro sampled size: ",mean.95ci.X(max.size.s,0), 
+# 
+#             "\nMean cumulative cases diag: ",mean.95ci.X(n.cum.diag,0), 
+#             "\nMean cumulative cases diag period 1: ",mean.95ci.X(n.cum.diag.p1,0), 
+#             "\nMean cumulative cases diag period 2: ",mean.95ci.X(n.cum.diag.p2,0), 
+#             "\nMax daily cases diag: ",mean.95ci.X(n.max.daily.diag,0), 
+#             "\nMean intro size diag: ",mean.95ci.X(mean.size.diag,0), 
+#             "\nMax intro size diag: ",mean.95ci.X(max.size.diag,0), 
+#                
+#             "\nMean cumulative cases all: ",mean.95ci.X(n.cum.all,0), 
+#             "\nMax daily cases all: ",mean.95ci.X(n.max.daily.all,0), 
+#             "\nMean intro size all: ",mean.95ci.X(mean.size.all,0), 
+#             "\nMax intro size all: ",mean.95ci.X(max.size.all,0)), 
+#     append=T, sep="\n", file=text.out)
+# 
+# ## Export for delay of peak incidence
+# can.var.max.cases<-max(can.var.cases$avgVOC_cases,na.rm = T)
+# day.can.var.max<-can.var.cases$date[which(can.var.cases$avgVOC_cases == can.var.max.cases)][1]
+# cat(paste0("\nNumber days earlier incidence peak: ", 
+#            mean.95ci.X(as.numeric(day.can.var.max - day.max.daily.diag))),
+#      append=T, sep="\n", file=text.out)
+# 
+# 
+# #Add export for averted cases diagnosed per day
+# print(paste0("\nMean cases diagnosed averted per day: ", mean.95ci.X(n.cum.diag/int.duration,1),
+#            "\nMean cases diagnosed averted per day period 1: ", mean.95ci.X(n.cum.diag.p1/(as.numeric(diff(per1)+1)),1),
+#      "\nMean cases diagnosed averted per day period 2: ", mean.95ci.X(n.cum.diag.p2/(as.numeric(diff(per2)+1)),1)))
+# 
+# ## Export percent averted
+# 
+# # % additional maximum daily incidence
+# can.var.max.cases<-max(can.var.cases$avgVOC_cases,na.rm = T)
+# max.cases.averted.perc<-n.max.daily.diag/can.var.max.cases*100
+# maxCI.averted<-mean.95ci.X(max.cases.averted.perc)
+#  
+# # percent additional cases cumulative (considering sampled only)
+# max.samp.cases.averted.perc<-(n.max.daily/can.var.max.cases)*100
+# maxCI.samp.averted<-mean.95ci.X(max.samp.cases.averted.perc)
+# 
+# 
+# ## % Additional cumulative cases 
+# 
+# # can.var.total.cases
+# mean.cases.averted.perc<-(n.cum.diag/can.var.total.cases)*100
+# #percent additional cases cumulative
+# meanCI.averted<-mean.95ci.X(mean.cases.averted.perc)
+# 
+# 
+# #percent additional cases cumulative (considering sampled only)
+# mean.samp.cases.averted.perc<-(n.cum/can.var.total.cases)*100
+
+
+```
+
+
+## mean and 95% CI daily cases across runs for each cluster
+```{r}
+# has to be a factor to group by, count up occurrences
+# draw.list.all$date<-factor(draw.list.all$date)
+# 
+# #in each draw (gruoping multiple runs per draw), sum of daily cases
+# cases.run.date<-draw.list.all %>%
+#   group_by(draw, date) %>%
+#   summarize(dailycase.sampled=sum(sampled),
+#             dailycase.diagnosed=sum(diagnosed),
+#             dailycase.all=n())
+# 
+# # head(cases.run.date,n=100) 
+# # sum(cases.run.date$dailycase[cases.run.date$draw==10])
+# 
+# #plot each one as trajectory of daily cases sampled
+# ggplot(cases.run.date)+
+#   geom_line(aes(x=as.Date(date), y=dailycase.sampled, group=draw,color=draw),stat="identity",alpha=0.3)+
+#   pubThemeDate+
+#   theme(legend.position = "none")+
+#   labs(x="Date",y="Daily cases averted (sampled)")
+# ggsave(paste0(f.out,"DailyCasesAvertedSampled.AcrossDraws.png"),height=4,width=5 )
+# 
+# #plot each one as trajectory of daily cases diagnosed
+# ymax<-max(cases.run.date$dailycase.diagnosed)*1.2
+# p.sims<-ggplot(cases.run.date)+
+#   geom_line(aes(x=as.Date(date), y=dailycase.diagnosed, group=draw,color=draw),stat="identity",alpha=0.4)+
+#   pubThemeDate+
+#   scaleDateFlex+
+#   scale_color_viridis_c()+
+#   theme(legend.position = "none")+
+#   labs(x=NULL,y="Daily cases averted (diagnosed)")+
+#   scale_y_continuous(expand=c(0,0))+
+#   coord_cartesian(ylim=c(0,ymax))
+# p.sims
+# ggsave(paste0(f.out,"DailyCasesAvertedDiagnosed.AcrossDraws.png"),height=4,width=5 )
+# 
+# #check cumsum (what is the sum of cum?) of each one
+# # cases.run.date %>% group_by(draw) %>% summarize(total=sum(n))
+# 
+# #now summarize daily cases across runs
+# cases.mean.date<-cases.run.date %>% 
+#   dplyr::group_by(date) %>%
+#   dplyr::summarise(mean.dailycase.sampled=mean(dailycase.sampled),
+#                    sd.dailycase.sampled=sd(dailycase.sampled),
+#                    
+#                    mean.dailycase.diagnosed=mean(dailycase.diagnosed),
+#                    sd.dailycase.diagnosed=sd(dailycase.diagnosed),
+#                    
+#                    mean.dailycase.all=mean(dailycase.all),
+#                    sd.dailycase.all=sd(dailycase.all))
+# 
+# #mutate confints - shoulld write a function for this in future
+# cases.mean.date<-cases.mean.date %>% mutate(margin.err.sampled= qt(p=0.05/2, df=(n.draw-1),lower.tail=F)*sd.dailycase.sampled/sqrt(n.draw),
+#                                             upper.dailycase.sampled=mean.dailycase.sampled + margin.err.sampled,
+#                                             lower.dailycase.sampled=mean.dailycase.sampled - margin.err.sampled,
+#                                             
+#                                             margin.err.diagnosed= qt(p=0.05/2, df=(n.draw-1),lower.tail=F)*sd.dailycase.diagnosed/sqrt(n.draw),
+#                                             upper.dailycase.diagnosed=mean.dailycase.diagnosed + margin.err.diagnosed,
+#                                             lower.dailycase.diagnosed=mean.dailycase.diagnosed - margin.err.diagnosed,
+#                                             
+#                                             margin.err.all= qt(p=0.05/2, df=(n.draw-1),lower.tail=F)*sd.dailycase.all/sqrt(n.draw),
+#                                             upper.dailycase.all=mean.dailycase.all + margin.err.all,
+#                                             lower.dailycase.all=mean.dailycase.all - margin.err.all)
+# # head(cases.mean.date)
+# 
+# #plot the mean daily cases over time
+# px1<-ggplot(cases.mean.date)+
+#   geom_line(aes(x=as.Date(date), y=mean.dailycase.sampled),stat="identity")+
+#   geom_ribbon(aes(x=as.Date(date), ymin=lower.dailycase.sampled, ymax=upper.dailycase.sampled),alpha=0.5)+
+#   pubThemeDate+
+#   labs(y="Mean daily cases averted (sampled)",x="Date")
+# px1
+# ggsave(paste0(f.out,"meanCI_DailyCasesAverted_Sampled.png"),width = 3,height=3)
+# 
+# #plot the mean daily cases diagnosed over time
+# px2<-ggplot(cases.mean.date)+
+#   geom_line(aes(x=as.Date(date), y=mean.dailycase.diagnosed),stat="identity")+
+#   geom_ribbon(aes(x=as.Date(date), ymin=lower.dailycase.diagnosed, ymax=upper.dailycase.diagnosed),alpha=0.5)+
+#   pubThemeDate+
+#   labs(y="Mean daily cases averted (diagnosed)",x="Date")
+# px2
+# ggsave(paste0(f.out,"meanCI_DailyCasesAverted_Diagnosed.png"),width = 3,height=3)
+# 
+# #grob it baby
+# plot_grid(px1, px2, labels=LETTERS[1:2], nrow=1, align="h")
+# ggsave(paste0(f.out,"meanCI_DailyCasesAverted_Sampled-Diagnosed.png"),width = 7,height=3.6)
+# 
+# #what is the cumsum of dailycases
+# sum(cases.mean.date$mean.dailycase.sampled)
+# mean.95ci.X(n.cum,0)
+# 
+# sum(cases.mean.date$mean.dailycase.diagnosed)
+# 
+# #export 
+# write.csv(cases.mean.date,file = paste0(f.out,"casesAverted.MeanDaily.csv"))
+```
+
+## check p.seqperdiag
+```{r}
+dtp.full<-read.csv("../../00_data/01_clean/clean_output/dtp.csv")
+dtp.phy<-read.csv("../../00_data/01_clean/clean_output/phyloDTP.csv")
+
+dtp.full.count<-dtp.full %>% 
+  filter(PREV_ARV != TRUE) %>%
+  filter(as.Date(FARVDT) >= as.Date("2018-01-01")) %>%
+  dplyr::summarise(total=n())
+dtp.phy.count<-dtp.phy %>% 
+  filter(PREV_ARV != TRUE) %>%
+  filter(as.Date(FARVDT) >= as.Date("2018-01-01")) %>%
+  dplyr::summarise(total=n())
+
+
+p.seqpercase
+dtp.phy.count/dtp.full.count #95%
+```
+
