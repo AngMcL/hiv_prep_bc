@@ -1,0 +1,225 @@
+---
+title: "Cluster Rt"
+output: html_document
+date: "2023-12-05"
+---
+
+## objectives
+* read in the cluster Rt for big clusters with >=10 members that were estimated in the cluster_linelist folder for multiple parameter sests
+* summarize across clusters how Rt varied by different paramset (use the BC code for this)
+* for a chosen key focal paramset, overlay all the cluster Rt trajectories
+* quantify how much the Rt changed over time, in response to PrEP availability, 
+* model how clusters were growing before PrEP to extrapolate a counterfactual of how they would have grown without PrEP
+* 
+
+# SETUP
+```{r}
+library(tidyverse)
+library(incidence)
+library(EpiEstim)
+library(anytime)
+library(lubridate)
+library(zoo)
+library(cowplot)
+pubTheme<-theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background=element_rect("grey95"), 
+                axis.line = element_line(colour = "black"),
+                text=element_text(size=10,face="bold"))
+```
+
+## INs and OUTs
+```{r}
+#folder with cluster specific Rt data incl NONclustered 9999
+f.in.clust<-"../cluster_linelist/2024-05-31_Results/"
+
+#files from sep subfolder for each paramset that contains all clsuters
+Re.files<-list.files(f.in.clust,all.files = T,recursive = T,pattern="Rt_epiestim",full.names = T)
+Re.files
+
+## read in cluster summary 
+#want to know if active since 2018, 2022
+clust.comp.in<-"../cluster_composition/2024-05-30_Results/ClusterComposition.csv"
+
+# metadata if needed
+# dtp<-read.csv("../../00_data/01_clean/clean_output/dtp.csv")
+# nrow(dtp) #14919, full DTP cohort incl ppl with prev ARV dt
+
+#OUTs
+today<-Sys.Date()
+f.out<-paste0(today,"_Results")
+if(!dir.exists(f.out)){dir.create(f.out)}
+```
+
+#read in cluster composition
+```{r}
+clust.comp<-read.csv(clust.comp.in)
+table(clust.comp$active) #84 active since 2018 #85 with the non-clustered as 9999
+table(clust.comp$active22) #25 active in 2022
+#note that the big distinction in this df is >20, not 10 (as was done for Re)
+
+#clust comp extraactive >=3 new cases
+clust.comp$active3<-FALSE
+clust.comp$active3[which(clust.comp$n_seroconv_2018>=3)]<-TRUE
+
+#identify big active clusties
+active.clust<-clust.comp$clusterID[which(clust.comp$active==T)]
+med.active.clust<-clust.comp$clusterID[which(clust.comp$active3==TRUE & clust.comp$medium==TRUE)]# >=size 10
+# med.active.clust<-clust.comp$clusterID[which(clust.comp$active==T & clust.comp$medium==T)]# >=size 10
+big.active.clust<-clust.comp$clusterID[which(clust.comp$active==T & clust.comp$big==T)]
+big.active22.clus<-clust.comp$clusterID[which(clust.comp$active22==T)]
+
+```
+
+## Read in the smoothed cluster Rts for each paramset (one paramset per Re file)
+```{r}
+# read in all of the data into a list
+all.re<-replicate(n=length(Re.files), vector())
+
+for (i in 1:length(Re.files)){
+  # read and format
+  all.re[[i]]<-read.csv(Re.files[i])
+  all.re[[i]]$date_start<-as.Date(all.re[[i]]$date_start)
+  
+  # add params as a column
+  all.re[[i]]$paramset<-str_replace_all(unlist(str_split(Re.files[[i]],"/"))[[5]],".csv|clust_Rt_epiestim_","")
+}
+
+# bind_row them all
+all.re.df<-bind_rows(all.re)
+
+#order nicely
+params<-unique(all.re.df$paramset) #works well
+
+#clean names
+params<-str_replace_all(params,"Rt_epi_","")
+all.re.df$paramset<-str_replace_all(all.re.df$paramset,"Rt_epi_","")
+
+# last<-str_which(params,"mean365")
+# params<-params[c(1:(last[1]-1), (last(last)+1):length(params), last)]
+
+all.re.df$paramset<-factor(all.re.df$paramset, levels=params)
+
+#Make a separated paramset
+all.re.df<-all.re.df %>% separate(col=paramset,sep="_",into=LETTERS[1:3],remove = F)
+
+all.re.df$A<-factor(all.re.df$A, levels=c("mean182","mean365","mean730"))
+all.re.df$B<-factor(all.re.df$B, levels=c("std182","std365"))
+all.re.df$C<-factor(all.re.df$C, levels=c("int182","int365"))
+
+# table(all.re.df$A,all.re.df$B,all.re.df$C)
+
+## Where is the CI too wide?
+all.re.df<-all.re.df %>% mutate(CI.width=`Quantile.0.975.R.`-`Quantile.0.025.R.`, .keep = "all")
+
+wide<-10
+
+#add an indicator variable based on whether it is too wide
+all.re.df<-all.re.df %>% mutate(too.wide = CI.width>=wide)
+table(all.re.df$too.wide)
+
+
+#export this - wait for remainder of files to be done 
+write.csv(all.re.df, paste0(f.out, "/all.cluster.re.df.csv"))
+```
+
+## short cut
+```{r}
+# read in above 
+# all.re.df<-read.csv(paste0(f.out, "/all.cluster.re.df.csv"))
+```
+
+## join the cluster summaries in there
+```{r}
+
+# find primary risk
+clust.comp$risk<-NA
+for (i in 1:nrow(clust.comp)){
+  #If NA, just say mixed
+  if(is.na(clust.comp$perc_MSM[i])){
+    clust.comp$risk[i]<-"mixed";next}
+  if(clust.comp$perc_MSM[i]>=50){
+    clust.comp$risk[i]<-"gbMSM"; next
+  }
+  if(clust.comp$perc_IDU[i]>=50){
+    clust.comp$risk[i]<-"PWID"; next
+  }
+  if(clust.comp$perc_HET[i]>=50){
+    clust.comp$risk[i]<-"HET"; next
+  }
+  #if none of these, then mixed
+  clust.comp$risk[i]<-"mixed"
+}
+table(clust.comp$risk[clust.comp$active==TRUE])
+
+#join to the Rt data #no 9999
+table(all.re.df$clusterID)
+clust.comp$clusterID<-factor(clust.comp$clusterID)
+all.re.df$clusterID<-factor(all.re.df$clusterID)
+all.re.df.rsk<-left_join(all.re.df, clust.comp, by="clusterID")
+
+riskcolz<-c("darkred","darkblue","darkorange3","darkgreen")
+names(riskcolz)<-c("All","gbMSM","PWID","HET")
+```
+
+
+## Plots of Re by cluster, no wide CI, multiple paramsets
+```{r}
+#these have no data after excl wide
+# med.active.clust.ls<-med.active.clust[-which(med.active.clust %in% c(14, 29, 221, 206, 132,
+#                                                                   109, 168, 203, 193, 201, 208))]
+# 
+# med.active.clust.ls<-med.active.clust[-which(med.active.clust %in% c(168,193))]
+
+plot.rtclust.paramset<-function(mean,sd,int){
+
+  temp<-all.re.df.rsk %>%
+  filter(too.wide==FALSE) %>%
+  filter(clusterID %in% med.active.clust) %>% #only look at clusters with new cases since 2018 and size>9
+  filter(A==mean) %>%
+  filter(B==sd) %>%
+  filter(C==int)%>%
+    filter(date_start>=as.Date("2015-01-01"))
+  newclust.ord<-names(which(table(temp$clusterID)>0))
+  temp$clusterID<-factor(temp$clusterID, levels=newclust.ord)
+  ggplot(temp)+
+  
+    #Periods
+    geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+    #vertical line/annotation for COVID-19
+    geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+    #vertical line for post-COVID-19 2022-onwards
+    geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  
+    #color by cluster predominant population
+    geom_line(aes(x=date_start, y=meanR_smooth, color=risk),alpha=0.5)+
+    #only show mean for all clusters for now
+    geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth, fill=risk),alpha=0.1)+
+    
+    pubTheme+
+    geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+    labs(x=NULL, y="Re")+
+    theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+      legend.position = "none", legend.text=element_text(size=rel(0.5)))+ 
+    scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+                 limits = c(as.Date("2015-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+    scale_color_manual(values=riskcolz)+
+    scale_fill_manual(values=riskcolz)+
+    scale_y_continuous(expand=c(0.01,1),breaks = seq(0,14,2))+
+    facet_wrap(.~clusterID,drop = TRUE, scales="free_y",nrow=6)
+  ggsave(paste0(f.out,"/Rt_FACET-clust_2012-pres_",mean,"_",sd,"_",int,".png"),height=8,width=8.5)
+}
+
+#RUN for several paramsets
+plot.rtclust.paramset("mean365","std182","int182") #middleground/std
+
+plot.rtclust.paramset("mean182","std182","int182") #sml mean
+plot.rtclust.paramset("mean730","std182","int182") #lrg mean
+
+plot.rtclust.paramset("mean365","std365","int182") #longer sd
+
+plot.rtclust.paramset("mean365","std182","int365") #longer interval window
+
+```
+
+
