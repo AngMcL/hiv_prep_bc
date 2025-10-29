@@ -1,0 +1,2958 @@
+---
+title: "Calculate HIV Incidence BC"
+author: "Angela"
+date: "12/08/2021"
+output: html_document
+---
+
+# Objectives
+* read in the DTP dataset 
+* read in the cohort dataset (including those with no seqs)
+* use the date of first viral load to estimate infection date for both
+* generate and export a line list of infections
+* summarize as a daily incidence and export (for use in EpiEstim of Rt)
+
+## setup
+```{r}
+library(tidyverse)
+library(incidence)
+library(EpiEstim)
+library(anytime)
+library(zoo)
+library(cowplot)
+pubTheme<-theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background=element_rect("grey95"), 
+                axis.line = element_line(colour = "black"),
+                text=element_text(size=10,face="bold"))
+```
+
+## INs and OUTs
+```{r}
+#MAIN DATA
+dtp<-read.csv("../00_data/01_clean/clean_output/dtp.csv")
+dtp.all<-dtp
+nrow(dtp) #14919, full DTP cohort incl ppl with prev ARV dt
+table(dtp$PREV_ARV)
+
+vl<-read.csv("../00_data/01_clean/clean_output/vl.csv")
+nrow(vl) #one row for each unique measurement
+length(unique(vl$PATID)) #13976 unique pats
+
+phylodtp<-read.csv("../00_data/01_clean/clean_output/dtp.csv")
+nrow(phylodtp) #14919
+
+cohort<-read.csv("../00_data/00_edar314_01_data/E314_01_COHORT.csv")
+nrow(cohort) #14919
+table(cohort$PREV_ARV)
+
+#INPUT folders for below Re calculated overall and by risk group
+Re.all.in<-paste0("2024-05-21","_Results/Re_all/")
+Re.rsk.in<-paste0("2024-05-21","_Results/Re_RskGrp/")
+
+
+# #inspect
+# head(dtp)
+# nrow(dtp)
+# length(unique(dtp$PATID))
+# which(is.na(dtp$PATID))
+
+#OUTs
+today<-Sys.Date()
+f.out<-paste0(today,"_Results")
+if(!dir.exists(f.out)){dir.create(f.out)}
+
+#Re out for risk groups
+f.out.rsk<-paste0(f.out,"/Re_RskGrp")
+if(!dir.exists(f.out.rsk)){dir.create(f.out.rsk)}
+
+## make a subfolder for output
+f.out.re<-paste0(f.out,"/Re_all")
+if(!dir.exists(f.out.re)){dir.create(f.out.re)}
+
+
+```
+
+## use the cohort data (all pats even if no seq)
+```{r}
+nrow(cohort) #14919
+
+#dates
+any(is.na(cohort$FARVDT))
+head(cohort$FARVDT) #"12/22/2010" 
+#test
+as.Date(parse_date_time(head(cohort$FARVDT), "mdy"))
+
+cohort$FARVDT<-as.Date(parse_date_time(cohort$FARVDT, "mdy"))
+hist(cohort$FARVDT,breaks=30)
+
+```
+
+
+## find date first vl - can skip
+```{r}
+# head(table(dtp$VDT_BASE))
+# head(table(dtp$FARVDT))
+# length(which(is.na(dtp$VDT_BASE))) #3610 with no baseline viral load dt
+# 
+# #to estimate this we will look at the VDT_BASE
+# dtp$VDT_BASE2<-as.Date(NA)
+# #cross-check to the vl dataframe
+# #compare it to the date first ARV. Take the earliest
+# for (i in 1:nrow(dtp)){
+#   matchy<-which(vl$PATID == dtp$PATID[i])
+#   dt1<-as.Date(dtp$VDT_BASE[i])
+#   dt2<-first(sort(as.Date(vl$COLDATE[matchy]),na.rm=T))
+#   if (is.na(dt2)) {dtp$VDT_BASE2[i]<-dt1; next} # if no matches, give it the old dt1
+#   if (is.na(dt1)) {dtp$VDT_BASE2[i]<-dt2; next} # give it the new dt
+#   #might still be cases where both NA, then will just end up with NA in this cell
+#   #if both non-NA, take the earliest
+#   dtp$VDT_BASE2[i]<-as.Date(first(sort(c(dt1,dt2))))
+# }
+# 
+# #Check it is improved
+# length(which(dtp$VDT_BASE != dtp$VDT_BASE2))
+# length(which(is.na(dtp$VDT_BASE2))) #1123, improvement!
+# head(dtp$VDT_BASE2,n=20)
+# head(dtp$VDT_BASE,n=20)
+
+#compare to the HIV SERO DATE - sometimes these are unreliable though...
+# table(phylodtp$HIV_SERO_DATE) #some allegedly infected in the 40s... unlikely...
+# for (i in 1:nrow(dtp)){
+#   dt1<-dtp$VDT_BASE2[i]
+#   matchy<-which(phylodtp$PATID == dtp$PATID[i])
+#   phylodtp$HIV_SERO_DATE[matchy]
+# }
+
+#can we apply CD4 counts to estimate the date????
+# https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0246135
+#for now estimate date of diagnosis
+```
+
+# Incidence for all DTP cohort data 
+
+## New cases by quarter, year, month
+```{r}
+# To start, we use the date of first antiretroviral (which appears to precede the first vl date)
+#also it is complete, which is nice
+
+### remove patients who have prev_ARV==1
+dtp<-dtp %>% filter(PREV_ARV != 1)
+nrow(dtp) #12775
+
+#group by FARV date
+newARV<-dtp %>% 
+  dplyr::group_by(FARVDT) %>% 
+  dplyr::summarize(count=n()) %>%
+  as.data.frame()
+# head(newARV)
+INC<-incidence::as.incidence(newARV$count, dates = newARV$FARVDT)
+plot(INC)
+ggsave(paste0(f.out,"/BC_incidenceWeekly_FARVDT.png"),width=6,height=4)
+
+#QUARTERLY INCIDENCE
+dtp$quarter.farv<-quarter(dtp$FARVDT,type = "date_first")
+dtp2.farv<-dtp %>% dplyr::group_by(quarter.farv) %>% tally() %>% as.data.frame()
+ymax.new<-320
+p.newcases<-ggplot(dtp2.farv)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkred")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases")+
+  pubTheme
+p.newcases
+ggsave(paste0(f.out,"/BC_cases_quarterly_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-120
+p.newcases2<-ggplot(dtp2.farv)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkred")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("2012-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases")+
+  pubTheme
+p.newcases2
+ggsave(paste0(f.out,"/BC_cases_quarterly_2012_farvdt.png"),width=6,height=4)
+
+## YEARLY NEW CASES ##
+dtp$FARVDT<-as.Date(dtp$FARVDT)
+dtp$year<-format(dtp$FARVDT, format="%Y")
+table(dtp$year)
+dtp$yearmonth<-zoo::as.yearmon(dtp$FARVDT)
+table(dtp$yearmonth)
+
+dtp3.farv<-dtp %>% dplyr::group_by(year) %>% tally() %>% as.data.frame()
+class(dtp3.farv$year)<-"numeric"
+ymax.new<-1000
+p.newcases.y<-ggplot(dtp3.farv)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = 2018,
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = 2020,
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkred")+
+  scale_x_continuous(limits=c(1987,2023),breaks=seq(1987,2022,1),labels=seq(1987,2022,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new),expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases")+
+  pubTheme
+p.newcases.y
+ggsave(paste0(f.out,"/BC_cases_annual_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-420
+p.newcases.y2<-ggplot(dtp3.farv)+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkred")+
+  scale_x_continuous(limits=c(2011.5,2023),breaks=seq(2012,2023,1))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases")+
+  pubTheme
+p.newcases.y2
+ggsave(paste0(f.out,"/BC_cases_annual_2012_farvdt.png"),width=6,height=4)
+
+### BY YEARMONTH since 2012
+dtp4.farv<-dtp %>% dplyr::group_by(yearmonth) %>% tally() %>% as.data.frame()
+# table(dtp4.farv$yearmonth)
+ymax.new<-55
+p.newcases.ym<-ggplot(dtp4.farv)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_bar(aes(x=yearmonth,y=n),stat="identity",fill="darkred")+
+  scale_x_yearmon(limits=c(as.yearmon("2012-01"),as.yearmon("2023-01")),
+                  breaks=c(dtp4.farv$yearmonth),
+                  expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Monthly new HIV cases")+
+  pubTheme
+p.newcases.ym
+ggsave(paste0(f.out,"/BC_cases_yearmon_farvdt_2012.png"),width=8,height=4)
+
+```
+
+## population size over time
+```{r}
+#quarterly population size of BC over time
+# How to cite: Statistics Canada. Table 17-10-0009-01  Population estimates, quarterly
+# DOI: https://doi.org/10.25318/1710000901-eng
+#accessed 2023-11-15
+#relesae date 2023-09-27
+#https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1710000901&cubeTimeFrame.startMonth=07&cubeTimeFrame.startYear=1987&cubeTimeFrame.endMonth=07&cubeTimeFrame.endYear=2023&referencePeriods=19860701%2C20230701
+pops<-read.csv("PopulationSize/1710000901-eng_mod.csv")
+
+head(pops,n=20)
+#only BC
+bc<-pops[which(pops$Geography=="British Columbia"),]
+bc<-bc[,-1]
+
+#replace "Q" for quarter with first date of quarter as in dates in incidence
+quart.rep<-c("Q1."="01-01-", 
+             "Q2."="04-01-",
+             "Q3."="07-01-",
+             "Q4."="10-01-")
+colnames(bc)<-colnames(bc) %>% str_replace_all(quart.rep) #mm-dd-yyyy
+# head(dtp$quarter) #yyyy-mm-dd
+# dtp$quarter<-quarter(colnames(bc),type = "date_first")
+
+#reforamt for all except geography
+colnames(bc)<-as.character(as.Date(colnames(bc), tryFormats = "%m-%d-%Y"))
+colnames(bc)
+
+#make long
+bc.pops<-bc %>% pivot_longer(cols=1:ncol(bc), names_to = "quarter", values_to = "popBC") %>% as.data.frame()
+head(bc.pops)
+#format as dates
+bc.pops$quarter<-quarter(bc.pops$quarter,type = "date_first")
+
+p.pop.bc<-ggplot(bc.pops)+
+  geom_line(aes(x=quarter,y=popBC), color="darkblue",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Population size, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(breaks=c(3e6, 3.5e6, 4e6, 4.5e6, 5e6, 5.5e6),
+                    labels=c("3M","3.5M", "4M","4.5M","5M","5.5M"))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+p.pop.bc
+ggsave(paste0(f.out,"/populationSize_BC_1985-pres.png"),height=3,width=5)
+
+
+## what is the pop size on average by calendar year?
+bc.pops$year<-format(bc.pops$quarter, "%Y")
+table(bc.pops$year)
+#calc average for each year
+bc.pops.year<-bc.pops %>% group_by(year) %>% summarize(avepopBC=mean(popBC)) %>% as.data.frame()
+class(bc.pops.year$year)<-"numeric"
+#plot to check
+p.pop.bc.y<-ggplot(bc.pops.year)+
+  geom_line(aes(x=year,y=avepopBC), color="darkblue",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Population size, BC")+
+  scale_y_continuous(breaks=c(3e6, 3.5e6, 4e6, 4.5e6, 5e6, 5.5e6),
+                    labels=c("3M","3.5M", "4M","4.5M","5M","5.5M"))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+p.pop.bc.y
+ggsave(paste0(f.out,"/populationSize_BC_1985-pres_year.png"),height=3,width=5)
+
+##what is pop size in each moth?
+#just take the pop size of the quarter in which each month falls
+all(dtp$quarter.farv %in%bc.pops$quarter)
+#need cross talk between formats
+```
+
+## normalize new cases by quarter, year, month by pop
+```{r}
+## QUARTERLY
+## link population size to incidence by quarter
+dtp2.farv$quarter<-dtp2.farv$quarter.farv
+dtp.pop<-left_join(dtp2.farv, bc.pops, by="quarter")
+# head(dtp.pop)
+
+#normalize per capita
+dtp.pop<-dtp.pop %>% mutate(n.percap=n/popBC*100000)
+
+# PLOT quaterly cases per capita
+ymax.new<-10
+p.newcases.percap<-ggplot(dtp.pop)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=quarter,y=n.percap), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Quarterly new HIV cases in BC per 100,000")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+p.newcases.percap
+ggsave(paste0(f.out,"/quarterly_HIVincidence_percap.png"),height=3.5,width=5)
+
+
+# quaterly cases per capita, RECENT YEARS
+ymax.new<-3
+ggplot(dtp.pop)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=quarter,y=n.percap), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Quarterly new HIV cases in BC per 100,000")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.new),expand=c(0,0))
+ggsave(paste0(f.out,"/quarterly_HIVincidence_percap_2012-pres.png"),height=3.5,width=5)
+
+#Convert to per year
+
+# quaterly to annual cases per capita, RECENT YEARS
+ymax.new<-3*4
+p.newcases.peryear<-ggplot(dtp.pop)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=quarter,y=n.percap*4), color="darkred",lwd=1.5)+ #multiply per quarter by 4 to by year
+  pubTheme+
+  labs(x=NULL,y="New HIV cases per 100,000 per year")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("2012-01-01"),as.Date("2022-12-31")),expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.new),expand=c(0,0))
+p.newcases.peryear
+ggsave(paste0(f.out,"/HIVincidence_percap_peryear_2012-pres.png"),height=3.5,width=5)
+
+
+## Sum new cases per cap in past 12 months, then average to get a rolling annual ave
+# sum each value with preceding 3 (total=4 quarts), then rolling average it all
+dtp.pop2<-dtp.pop
+dtp.pop2$n.percap.last4q<-NA
+for (i in 4:nrow(dtp.pop2)){
+  dtp.pop2$n.percap.last4q[i]<-sum (dtp.pop2$n.percap[i], dtp.pop2$n.percap[(i-3):(i-1)] )
+}
+dtp.pop2<-dtp.pop2 %>% mutate( n.percap.last4q.ave = rollmean(n.percap.last4q, k = 4, fill = NA,align="right"))
+#where couldn't calcualte mean b/c of limited data?
+tail(dtp.pop2,n=10)
+#last two obs
+# dtp.pop2$n.percap.last4q.ave[(nrow(dtp.pop2)-1) : nrow(dtp.pop2)]
+
+#plot rolling mean of annual cases per cap in past 12 mo
+ymax<-27
+p.annualcases.percap<-ggplot(dtp.pop2)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=quarter,y=n.percap.last4q.ave), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Average new HIV cases in\n prev. 12 mo. per 100,000")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax),expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+
+p.annualcases.percap
+ggsave(paste0(f.out,"/annual_HIVincidence_prev12mo_ave_percap.png"),height=3.5,width=5)
+
+#plot rolling mean of annual cases per cap in past 12 mo, since 2012
+ymax<-15
+p.annualcases.percap.2012<-ggplot(dtp.pop2, aes(x=quarter,y=n.percap.last4q.ave))+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  ## line and smoothed trend
+  geom_line(color="darkred",lwd=1.5)+
+  geom_smooth(alpha=0.2,color="darkred",fill="darkred",linetype=5,linewidth=0.4)+
+  pubTheme+
+  labs(x=NULL,y="Average new HIV cases in\n prev. 12 mo. per 100,000")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+    scale_y_continuous(limits=c(0,ymax),expand=c(0,0))
+
+p.annualcases.percap.2012
+ggsave(paste0(f.out,"/annual_HIVincidence_prev12mo_ave_percap_2012-pres.png"),height=4,width=4)
+
+## Calculate new HIV cases per calendar year per cap (summed by calendar year, not by prev 12 mo)
+## link population size to incidence by YEAR
+dtp.pop.y<-left_join(dtp3.farv, bc.pops.year, by="year")
+
+#normalize per capita
+dtp.pop.y<-dtp.pop.y %>% mutate(n.percap=n/avepopBC*100000)
+head(dtp.pop.y)
+class(dtp.pop.y$year)
+
+# PLOT annual cases per capita
+ymax.new<-26
+p.newcases.percap.y<-ggplot(dtp.pop.y)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=year,y=n.percap), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Annual new HIV cases in BC per 100,000")+
+  scale_x_continuous(limits = c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+p.newcases.percap.y
+ggsave(paste0(f.out,"/annual_HIVincidence_percap.png"),height=3.5,width=5)
+
+# annual cases per capita, RECENT YEARS
+ymax.new<-10
+p.newcases.percap.y2<-ggplot(dtp.pop.y)+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2018-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2020-03-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=year+0.5, y=n.percap), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Annual new HIV cases per 100,000")+
+  scale_x_continuous(limits = c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.new),expand=c(0,0))
+p.newcases.percap.y2
+ggsave(paste0(f.out,"/annual_HIVincidence_percap_2012-pres.png"),height=3.5,width=5)
+
+
+## repeat for new HIV cases per calendar month per cap
+## link population size to incidence by quarter
+yearmo.qu<-dtp %>% select(c("quarter.farv","yearmonth"))
+yearmo.qu<-yearmo.qu[-duplicated(yearmo.qu$yearmonth),]
+dtp4.farv<-dtp4.farv %>% left_join(yearmo.qu, by="yearmonth")
+dtp4.farv$quarter<-dtp4.farv$quarter.farv
+dtp.pop.m<-left_join(dtp4.farv, bc.pops, by="quarter")
+# head(dtp.pop)
+
+#normalize per capita
+dtp.pop.m<-dtp.pop.m %>% mutate(n.percap=n/popBC*100000)
+
+# PLOT quaterly cases per capita
+ymax.new<-5
+p.newcases.percap.m<-ggplot(dtp.pop.m)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=yearmonth,y=n.percap), color="darkred",lwd=1.5)+
+  pubTheme+
+  labs(x=NULL,y="Monthly new HIV cases in BC per 100,000")+
+  scale_x_yearmon(limits = c(as.yearmon("1987-01-01"),as.yearmon("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+p.newcases.percap.m
+ggsave(paste0(f.out,"/monthly_HIVincidence_percap.png"),height=3.5,width=5)
+
+
+# quaterly cases per capita, RECENT YEARS
+ymax.new<-1.1
+p.newcases.percap.m2<-ggplot(dtp.pop.m)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.yearmon("2018-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2018-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.yearmon("2020-03"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2020-03"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.yearmon("2022-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.yearmon("2022-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_line(aes(x=yearmonth,y=n.percap), color="darkred",lwd=1)+
+  pubTheme+
+  labs(x=NULL,y="Monthly new HIV cases per 100,000")+
+  scale_x_yearmon(limits = c(as.yearmon("2012-01-01"),as.yearmon("2023-01-01")),
+                  breaks=as.yearmon(unique(str_subset(dtp.pop.m$yearmonth,"Jan"))),
+                  expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.new),expand=c(0,0))
+p.newcases.percap.m2
+ggsave(paste0(f.out,"/monthly_HIVincidence_percap_2012-pres.png"),height=3.5,width=5)
+
+```
+
+## Composite figure of cases, incidence for prov
+```{r}
+#A) number of new cases per quarter, B) number of new cases per quarter per capita, C) rolling average annual new cases per capita, D) zoomed into 2012 - pres. with rolling average
+row1.1<-plot_grid(p.newcases.y, p.newcases.peryear, align="hv",
+          labels=LETTERS[1:2])
+row1.1
+ggsave(paste0(f.out,"/comp_newcases-inc-percap.png"),height=3.25,width=8.5,units="in")
+
+```
+
+## export tables of new cases by year, incidence 
+```{r}
+write.csv(dtp.pop.y,paste0(f.out,"/AnnualNewHIVCasesPerCap.csv"))
+
+dtp.pop.y$n.percap[dtp.pop.y$year==2012]
+```
+
+
+## calculate growth rate r by month, year
+```{r}
+# r<-newcases/time/popsize
+## changed to yearmonth
+
+# Need to calc size of prevalent population 
+#pop size= popsize (t-1) + new cases (delta t) - deaths and emigrations
+## CHANGE THIS to be end_follow_dt which also will include those who move
+dtp.dd<-dtp %>% filter(END_FOLLOW_STATUS %in% c("death_non_accid", "death_accid", "cens_MV"))
+dtp.dd$deathmon<-as.yearmon(dtp.dd$END_FOLLOW_DT)
+dtp.d<-dtp.dd %>% group_by(deathmon) %>% tally() %>% as.data.frame()
+colnames(dtp.d)<-c("yearmonth","n.death")
+
+#quickly plot this over time
+ymax.new<-35
+p.death.ym<-ggplot(dtp.d)+
+#vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.yearmon("2018-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2018-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.yearmon("2020-03"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2020-03"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.yearmon("2022-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.yearmon("2022-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+
+  geom_bar(aes(x=yearmonth,y=n.death),stat="identity",fill="red4")+
+  scale_x_yearmon(limits=c(as.yearmon("2012-01"),as.yearmon("2023-01")),
+                  breaks=c(dtp4.farv$yearmonth),
+                  expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Monthly removals (death, emigration)")+
+  pubTheme
+p.death.ym
+ggsave(paste0(f.out,"/BC_removals_yearmon_2012.png"),width=8,height=4)
+
+
+## need to add in the new migrations (prev-arv=1)
+dtp.prevarv<-dtp.all %>% filter(PREV_ARV == 1)
+dtp.prevarv$yearmonth<-zoo::as.yearmon(dtp.prevarv$FARVDT)
+dtp.prevarv2<-dtp.prevarv %>% dplyr::group_by(yearmonth) %>% tally() %>% as.data.frame()
+colnames(dtp.prevarv2)[2]<-"n.migrant"
+
+#quickly plot this over time
+ymax.new<-30
+p.migrant.ym<-ggplot(dtp.prevarv2)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.yearmon("2018-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2018-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.yearmon("2020-03"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2020-03"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.yearmon("2022-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.yearmon("2022-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  
+  geom_bar(aes(x=yearmonth,y=n.migrant),stat="identity",fill="red4")+
+  scale_x_yearmon(limits=c(as.yearmon("2012-01"),as.yearmon("2023-01")),
+                  breaks=c(dtp4.farv$yearmonth),
+                  expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Monthly new HIV+ migrants")+
+  pubTheme
+p.migrant.ym
+ggsave(paste0(f.out,"/BC_migrants_yearmon_farvdt_2012.png"),width=8,height=4)
+
+
+#join this onto the new cases summary
+dtp.cases<-dtp %>% dplyr::group_by(yearmonth) %>% tally() %>% as.data.frame()
+
+colnames(dtp.cases)[2]<-"n.newcase"
+dtp.casedeath.1<-left_join(dtp.cases, dtp.d, by="yearmonth")
+
+#join the HIV+ migrants
+dtp.casedeath<-dtp.casedeath.1 %>% left_join(dtp.prevarv2, by="yearmonth")
+
+#walk through each month of new cases
+dtp.casedeath$prev<-NA
+for(i in 1:nrow(dtp.casedeath)){
+  if(i==1){
+    dtp.casedeath$prev[i]<-dtp.casedeath$n.newcase[i] 
+    next
+  }
+  dtp.casedeath$prev[i]<-sum(dtp.casedeath$prev[i-1], dtp.casedeath$n.newcase[i], dtp.casedeath$n.migrant[i],
+                             -(dtp.casedeath$n.death[i-1]),na.rm = T)
+}
+
+##normalize to pop size
+## link population size to incidence by quarter
+# yearmo.qu<-dtp %>% select(c("quarter.farv","yearmonth"))
+# yearmo.qu<-yearmo.qu[-duplicated(yearmo.qu$yearmonth),]
+# dtp4.farv<-dtp4.farv %>% left_join(yearmo.qu, by="yearmonth")
+# dtp4.farv$quarter<-dtp4.farv$quarter.farv
+# dtp.pop.m<-left_join(dtp4.farv, bc.pops, by="quarter")
+# # head(dtp.pop)
+dtp.casedeath$quarter<-quarter(dtp.casedeath$yearmonth,type = "date_first")
+#join to pop
+dtp.casedeath<-left_join(dtp.casedeath, bc.pops, by="quarter")
+
+#normalize per capita
+dtp.casedeath<-dtp.casedeath%>% mutate(prev.percap=prev/popBC*100000)
+  
+  
+## Plot this prev over time
+p.prev<-ggplot(dtp.casedeath)+
+  geom_line(aes(x=yearmonth, y=prev.percap), color="darkred",linewidth=2)+
+  pubTheme+
+  labs(x=NULL, y="HIV+ prevalence per 100,000")+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.yearmon("2018-01"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.yearmon("2020-03"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.yearmon("2022-01"),linetype=2,size=0.7, alpha=0.6)+
+  
+  scale_x_yearmon(limits = c(as.yearmon("1987-01-01"),as.yearmon("2023-01-01")), expand=c(0,0),
+                   breaks=as.yearmon(unique(str_subset(dtp.casedeath$yearmonth,"Jan"))),
+                   labels=1987:2022)+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+  # scale_y_continuous(breaks=seq(0,10,1000),expand=c(0,0),limits=c(0,10))
+p.prev
+ggsave(paste0(f.out,"/PrevHIV-overtime-withMigrants.png"), width=5,height=3)
+
+write.csv(dtp.casedeath, paste0(f.out, "/Prevalence_ByYearMonth_NewcasesMigrantsDeathsEmigrations.csv"))
+```
+
+# Growth rate
+```{r}
+## growth rate over time
+dtp.grow<-dtp.casedeath %>% mutate(growth=n.newcase / prev)
+
+dtp.grow %>%
+  ggplot()+
+  geom_line(aes(x=yearmonth, y=growth),color="darkred")+
+  pubTheme+
+  labs(x=NULL, y="HIV growth rate, BC")+
+  scale_x_yearmon(limits = c(as.yearmon("1987-01-01"),as.yearmon("2023-01-01")), expand=c(0,0),
+                  breaks=as.yearmon(unique(str_subset(dtp.casedeath$yearmonth,"Jan"))))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))
+ggsave(paste0(f.out,"/growth-rate-bc.png"), width=5,height=3)
+
+# 2012 onwards
+ymax.r<-0.007
+p.grow<-dtp.grow %>%
+  ggplot(aes(x=yearmonth, y=growth),)+
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(color="darkred")+
+  geom_smooth(color="darkred", fill="darkred",linewidth=0.2,alpha=0.2,linetype=5)+
+  pubTheme+
+  labs(x=NULL, y="HIV growth rate per month")+
+  scale_x_yearmon(limits = c(as.yearmon("2012-01-01"),as.yearmon("2023-01-01")), expand=c(0,0),
+                  breaks=as.yearmon(unique(str_subset(dtp.grow$yearmonth,"Jan"))))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.r),expand=c(0,0))
+p.grow
+ggsave(paste0(f.out,"/growth-rate-bc-2012.png"), width=5,height=3)
+
+# 2012 onwards - ANNUAL = MONTHLY *12
+ymax.r<-0.007*12
+p.grow.an<-dtp.grow %>%
+  ggplot(aes(x=yearmonth, y=growth*12),)+
+   geom_vline(xintercept = as.yearmon("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.yearmon("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.yearmon("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.yearmon("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(color="darkred")+
+  geom_smooth(color="darkred", fill="darkred",linewidth=0.2,alpha=0.2,linetype=5)+
+  pubTheme+
+  labs(x=NULL, y="HIV growth rate per year")+
+  scale_x_yearmon(limits = c(as.yearmon("2012-01-01"),as.yearmon("2023-01-01")), expand=c(0,0),
+                  breaks=as.yearmon(unique(str_subset(dtp.grow$yearmonth,"Jan"))),
+                  labels=1987:2022)+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  scale_y_continuous(limits=c(0,ymax.r),expand=c(0,0))
+p.grow.an
+ggsave(paste0(f.out,"/annual-growth-rate-bc-2012.png"), width=5,height=3)
+
+
+#composite
+row2.1<-plot_grid(p.prev, p.grow.an, labels=c("C","D"), align="hv",nrow=1)
+row2.1
+plot_grid(row1.1,row2.1,align="hv",nrow=2,labels=NULL)
+ggsave(paste0(f.out,"/comp-prev-growth.png"),width=8.5,height=6.3)
+```
+
+# Risk group specific incidence and Rt
+
+## risk group cases over time
+```{r}
+#make a separate dtp df for each, then calculate incidence as done above
+dtp.m<-dtp %>% filter(RSK_MSM_R == "1")
+nrow(dtp.m) #5033
+
+dtp.i<-dtp %>% filter(RSK_IDU_RA == "1")
+nrow(dtp.i) #3870
+
+dtp.h<-dtp %>% filter(RSK_HETERO_R == "1")
+nrow(dtp.h) #2696
+
+## GBM ##
+
+#quarterly incidence by farvdt
+dtp2.m<-dtp.m %>% dplyr::group_by(quarter.farv) %>% tally() %>% as.data.frame()
+ymax.new<-240
+p.newcases.m<-ggplot(dtp2.m)+
+   geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkblue")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, GBM")+
+  pubTheme
+p.newcases.m
+ggsave(paste0(f.out,"/BC_cases_GBM_quarterly_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-60
+p.newcases.m2<-ggplot(dtp2.m)+
+   geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkblue")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("2012-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, GBM")+
+  pubTheme
+p.newcases.m2
+ggsave(paste0(f.out,"/BC_cases_GBM_quarterly_2012_farvdt.png"),width=6,height=4)
+
+
+## PWID
+#quarterly incidence by farvdt
+dtp2.i<-dtp.i %>% dplyr::group_by(quarter.farv) %>% tally() %>% as.data.frame()
+ymax.new<-140
+p.newcases.i<-ggplot(dtp2.i)+
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkorange3")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, PWID")+
+  pubTheme
+p.newcases.i
+ggsave(paste0(f.out,"/BC_cases_PWID_quarterly_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-30
+p.newcases.i2<-ggplot(dtp2.i)+
+   geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkorange3")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("2012-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, PWID")+
+  pubTheme
+p.newcases.i2
+ggsave(paste0(f.out,"/BC_cases_PWID_quarterly_2012_farvdt.png"),width=6,height=4)
+
+
+### HET ###
+#quarterly incidence by farvdt
+dtp2.h<-dtp.h %>% dplyr::group_by(quarter.farv) %>% tally() %>% as.data.frame()
+ymax.new<-75
+p.newcases.h<-ggplot(dtp2.h)+
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkgreen")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("1987-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, HET")+
+  pubTheme
+p.newcases.h
+ggsave(paste0(f.out,"/BC_cases_HET_quarterly_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-37
+p.newcases.h2<-ggplot(dtp2.h)+
+    geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_bar(aes(x=quarter.farv,y=n),stat="identity",fill="darkgreen")+
+  scale_x_date(date_breaks = "12 months",minor_breaks = "3 months",
+               date_labels = "%Y",
+               limits=c(as.Date("2012-01-01"),as.Date("2023-01-01")),expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Quarterly new HIV cases, HET")+
+  pubTheme
+p.newcases.h2
+ggsave(paste0(f.out,"/BC_cases_HET_quarterly_2012_farvdt.png"),width=6,height=4)
+
+```
+
+## plot quarterly cases by risk group in composite plot
+```{r}
+plot_grid(p.newcases, p.newcases.m, p.newcases.i, p.newcases.h, nrow=2,align="hv", labels=LETTERS[1:4])
+ggsave(paste0(f.out,"/BC_cases_all-and-rsk-grp_1987_farvdt.png"),width=8.5,height=6)
+
+# repeat for 2012 plots
+plot_grid(p.newcases2, p.newcases.m2, p.newcases.i2, p.newcases.h2, nrow=2,align="hv", labels=LETTERS[1:4])
+ggsave(paste0(f.out,"/BC_cases_all-and-rsk-grp_2012_farvdt.png"),width=8.5,height=6)
+
+```
+
+## annual cases by risk group
+```{r}
+## GBM ##
+
+#quarterly incidence by farvdt
+dtp2.m.y<-dtp.m%>% dplyr::group_by(year) %>% tally() %>% as.data.frame()
+dtp2.m.y$year<-as.numeric(dtp2.m.y$year)
+ymax.new<-500
+p.newcases.m.y<-ggplot(dtp2.m.y)+
+  #vertical line for PreP
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = 2022,
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkblue")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, GBM")+
+  pubTheme
+p.newcases.m.y
+ggsave(paste0(f.out,"/BC_cases_GBM_annual_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-160
+p.newcases.m2.y<-ggplot(dtp2.m.y)+
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkblue")+
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, GBM")+
+  pubTheme
+
+p.newcases.m2.y
+ggsave(paste0(f.out,"/BC_cases_GBM_annual_2012_farvdt.png"),width=6,height=4)
+
+
+## PWID
+#quarterly incidence by farvdt
+dtp2.i.y<-dtp.i %>% dplyr::group_by(year) %>% tally() %>% as.data.frame()
+dtp2.i.y$year<-as.numeric(dtp2.i.y$year)
+
+ymax.new<-440
+p.newcases.i.y<-ggplot(dtp2.i.y)+
+   geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkorange3")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, PWID")+
+  pubTheme
+p.newcases.i.y
+ggsave(paste0(f.out,"/BC_cases_PWID_annual_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-75
+p.newcases.i2.y<-ggplot(dtp2.i.y)+
+    geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkorange3")+
+    scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, PWID")+
+  pubTheme
+p.newcases.i2.y
+ggsave(paste0(f.out,"/BC_cases_PWID_annual_2012_farvdt.png"),width=6,height=4)
+
+
+### HET ###
+#Annual incidence by farvdt
+dtp2.h.y<-dtp.h %>% dplyr::group_by(year) %>% tally() %>% as.data.frame()
+dtp2.h.y$year<-as.numeric(dtp2.h.y$year)
+ymax.new<-250
+p.newcases.h.y<-ggplot(dtp2.h.y)+
+    geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkgreen")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, HET")+
+  pubTheme
+p.newcases.h.y
+ggsave(paste0(f.out,"/BC_cases_HET_annual_farvdt.png"),width=6,height=4)
+
+## since 2012
+ymax.new<-120
+p.newcases.h2.y<-ggplot(dtp2.h.y)+
+   geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year,y=n),stat="identity",fill="darkgreen")+
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="Annual new HIV cases, HET")+
+  pubTheme
+p.newcases.h2.y
+ggsave(paste0(f.out,"/BC_cases_HET_annual_2012_annual_farvdt.png"),width=6,height=4)
+
+```
+
+## plot Annual cases by risk group in composite plot
+```{r}
+plot_grid(p.newcases.y, p.newcases.m.y, p.newcases.i.y, p.newcases.h.y, nrow=2,align="hv", labels=LETTERS[1:4])
+ggsave(paste0(f.out,"/BC_cases_all-and-rsk-grp_1987_annual_farvdt.png"),width=8.5,height=6)
+
+# repeat for 2012 plots
+plot_grid(p.newcases.y2, p.newcases.m2.y, p.newcases.i2.y, p.newcases.h2.y, nrow=2,align="hv", labels=LETTERS[1:4])
+ggsave(paste0(f.out,"/BC_cases_all-and-rsk-grp_2012_annual_farvdt.png"),width=8.5,height=6)
+
+```
+
+## Export these dataframes 
+```{r}
+write.csv(dtp2.m.y,paste0(f.out, "/annualCasesMSM.csv"))
+write.csv(dtp2.h.y,paste0(f.out, "/annualCasesHET.csv"))
+write.csv(dtp2.i.y,paste0(f.out, "/annualCasesPWIDcsv"))
+```
+
+## Calculate percent change in each group
+```{r}
+#merge together and calculate % of new annual cases each represents
+colnames(dtp2.m.y)[2]<-"n.msm"
+colnames(dtp2.h.y)[2]<-"n.het"
+colnames(dtp2.i.y)[2]<-"n.pwid"
+colnames(dtp3.farv)[2]<-"n.all"
+
+annual.all<-left_join(dtp3.farv, dtp2.m.y, by="year")
+annual.all<-annual.all %>% left_join(dtp2.h.y, by="year")
+annual.all<-annual.all %>% left_join(dtp2.i.y, by="year")
+
+# head(annual.all)
+
+#calcualte proportions (note that they won't sum to one b/c of multiple risk factors reported)
+annual.all<-annual.all %>% mutate(perc.msm=n.msm/n.all*100,
+                      perc.pwid=n.pwid/n.all*100,
+                      perc.het=n.het/n.all*100)
+
+# head(annual.all)
+
+## Plot the percentage of annual cases in MSM
+perc.newcases.msm<-annual.all %>%
+  ggplot()+
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year+0.5,y=perc.msm),stat="identity",fill="darkblue")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,100), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="% GBM among new HIV cases")+
+  pubTheme
+perc.newcases.msm
+ggsave(paste0(f.out,"/BC_cases_PERCENTGBM_annual_farvdt.png"),width=6,height=4)
+
+## Plot the percentage of annual cases in each group
+perc.newcases.pwid<-annual.all %>%
+  ggplot()+
+ geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year+0.5,y=perc.pwid),stat="identity",fill="darkorange3")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,100), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="% PWID among new HIV cases")+
+  pubTheme
+perc.newcases.pwid
+ggsave(paste0(f.out,"/BC_cases_PERCENTpwid_annual_farvdt.png"),width=6,height=4)
+
+## Plot the percentage of annual cases in each group
+perc.newcases.het<-annual.all %>%
+  ggplot()+
+ geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year+0.5,y=perc.het),stat="identity",fill="darkgreen")+
+  scale_x_continuous(limits=c(1987,2023), breaks=seq(1987,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,100), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  labs(x=NULL, y="% HET among new HIV cases")+
+  pubTheme
+perc.newcases.het
+ggsave(paste0(f.out,"/BC_cases_PERCENThet_annual_farvdt.png"),width=6,height=4)
+
+
+#export the scv
+write.csv(annual.all, paste0(f.out, "/annual_cases_percent_riskgrp.csv"))
+
+## Make a composite of these three side by side
+plot_grid(perc.newcases.msm,perc.newcases.pwid,perc.newcases.het, labels=LETTERS[1:3],nrow=1, align="h")
+ggsave(paste0(f.out,"/comp_perc_riskgroup_newcase.png"),width=11, height=4)
+
+## Make a version of this plot for 2012 to present
+perc.newcases.msm12<-perc.newcases.msm +
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,60))
+perc.newcases.pwid12<-perc.newcases.pwid +
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,60))
+perc.newcases.het12<-perc.newcases.het +
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,60))
+
+plot_grid(perc.newcases.msm12,perc.newcases.pwid12,perc.newcases.het12, labels=LETTERS[1:3],nrow=1, align="h")
+ggsave(paste0(f.out,"/comp_perc_riskgroup_newcase_2012.png"),width=8.5, height=3)
+
+  
+```
+
+## plot percent change by year by risk group overlaid onto one line plot
+```{r}
+# head(annual.all)
+
+#calculate as the change in either a) number or b) percent of overall and each risk group (n[t] - n[t-1])/n[t-1])*100
+annual.all.p<-annual.all
+for(i in 1:nrow(annual.all.p)){
+  if(i==1){next}
+  annual.all.p$chg_n_All[i]<-((annual.all.p$n.all[i]-annual.all.p$n.all[i-1]) / annual.all.p$n.all[i-1]) *100
+  annual.all.p$chg_n_GBM[i]<-((annual.all.p$n.msm[i]-annual.all.p$n.msm[i-1]) / annual.all.p$n.msm[i-1]) *100
+  annual.all.p$chg_n_PWID[i]<-((annual.all.p$n.pwid[i]-annual.all.p$n.pwid[i-1]) / annual.all.p$n.pwid[i-1]) *100
+  annual.all.p$chg_n_HET[i]<-((annual.all.p$n.het[i]-annual.all.p$n.het[i-1]) / annual.all.p$n.het[i-1]) *100
+  
+  annual.all.p$chg_perc_GBM[i]<-((annual.all.p$perc.msm[i]-annual.all.p$perc.msm[i-1]) / annual.all.p$perc.msm[i-1]) *100
+  annual.all.p$chg_perc_PWID[i]<-((annual.all.p$perc.pwid[i]-annual.all.p$perc.pwid[i-1]) / annual.all.p$perc.pwid[i-1]) *100
+  annual.all.p$chg_perc_HET[i]<-((annual.all.p$perc.het[i]-annual.all.p$perc.het[i-1]) / annual.all.p$perc.het[i-1]) *100
+
+}
+# head(annual.all.p)
+
+#Need to pivot longer for this
+#do chg perc and chg n separately
+annual.all.long.n<-annual.all.p %>% pivot_longer(
+  cols=c("chg_n_All","chg_n_GBM" ,"chg_n_PWID" ,"chg_n_HET" ),
+  names_to="Group", values_to="chg_n") 
+# head(annual.all.long.n)
+annual.all.long.n$Group<-str_replace_all(annual.all.long.n$Group, "chg_n_","")
+
+# NOW plot this as point and line
+#colors though...
+riskcolz<-c("darkred","darkblue","darkorange3","darkgreen")
+names(riskcolz)<-c("All","GBM","PWID","HET")
+
+# class(annual.all.p$year)
+range<-range(annual.all.long.n$chg_n,na.rm = T)
+
+annual.all.long.n %>%
+  ggplot(aes(x=year, y= chg_n, group=Group))+
+  geom_point(aes(color=Group),alpha=0.7)+
+  geom_line(aes(color=Group),alpha=0.7)+
+  scale_color_manual(values=riskcolz)+
+  pubTheme+
+  labs(x=NULL, y="Annual % change, new HIV cases")+
+  scale_y_continuous(expand=c(0.01,0))+
+  theme(legend.position = c(0.7,0.5))
+ggsave(paste0(f.out,"/Annual perc change in new HIV cases.png"),height=3,width=5)
+
+range<-range(annual.all.long.n $chg_n[annual.all.long.n$year>=2012])
+# range
+annual.all.long.n<-as.data.frame(annual.all.long.n)
+annual.all.long.n$Group<-factor(annual.all.long.n$Group, levels=names(riskcolz))
+
+ymax.new<-70
+p.chg.perc<-annual.all.long.n %>%
+  filter(year>=2012) %>%
+  ggplot(aes(x=year+0.5, y= chg_n, group=Group))+
+ geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_hline(yintercept=0 ,linetype=3,size=0.5, alpha=0.7)+
+  geom_point(aes(color=Group),alpha=0.7, size=2, alpha=0.7)+
+  geom_line(aes(color=Group),alpha=0.7)+
+  scale_color_manual(values=riskcolz)+
+  pubTheme+
+  labs(x=NULL, y="Annual % change, new HIV cases")+
+  scale_y_continuous(expand=c(0,0),limits=c(-50,ymax.new))+
+  scale_x_continuous(limits=c(2012,2023),expand=c(0,0),breaks=seq(2012,2023,1))+
+  theme(legend.position ="none",#"right",
+        axis.text.x = element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)))+
+  guides(color=guide_legend(ncol=1,title.position = "top"))
+
+p.chg.perc
+ggsave(paste0(f.out,"/Annual perc change in new HIV cases_2012.png"),height=3,width=5)
+
+```
+
+## Plot new cases all togehter
+```{r}
+# head(annual.all)
+#show grouped by year, side by side for each group, 
+
+#Make a quick longy
+annual.all.long.ncase<-annual.all.p %>% pivot_longer(
+  cols=c("n.all","n.msm" ,"n.pwid" ,"n.het" ),
+  names_to="Group", values_to="n_case") 
+# head(annual.all.long.n)
+annual.all.long.ncase$Group<-str_replace_all(annual.all.long.n$Group, "n.","")
+annual.all.long.ncase$Group<-str_replace_all(annual.all.long.n$Group, c("msm"="GBM", "het"="HET", "pwid"="PWID", "all"="All"))
+
+ymax.new<-420
+p.cases.allandrisk<-ggplot(annual.all.long.ncase)+
+    geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  geom_bar(aes(x=year+0.5,y=n_case, group=Group, fill=Group),stat="identity", position="dodge", alpha=0.6)+
+  scale_x_continuous(limits=c(2012,2023), breaks=seq(2012,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position=c(0.99,0.96), legend.justification = c(1,1),
+        legend.title = element_text(size=rel(0.9)),legend.text = element_text(size=rel(0.8))
+        )+
+  labs(x=NULL, y="Annual new HIV cases")+
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  guides(fill=guide_legend(title="Population"))
+p.cases.allandrisk
+
+ggsave(paste0(f.out,"/AllandRiskGroup_NewCAses.png"),width=6,height=4)
+
+#version with less x
+# also change so that prep is not a highlight, but instead a dashed line with label
+# and add labels for other periods
+annual.all.long.n2<-annual.all.long.n %>% select(c(year,Group,chg_n))
+annual.all.long.ncase2<-annual.all.long.ncase %>% left_join(annual.all.long.n2,by=c("Group","year"))
+
+ymax.new<-350
+p.cases.allandrisk.lessx<-ggplot(annual.all.long.ncase2)+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = 2018,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2018,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=3)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = 2020,linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = 2020,
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=3)+
+   geom_vline(xintercept = 2022,linetype=2,size=0.7, alpha=0.6)+
+  #DATA
+  geom_point(aes(x=year+0.5,y=n_case, group=Group, color=Group),alpha=0.7, size=2, alpha=0.7)+
+  geom_line(aes(x=year+0.5,y=n_case, group=Group, color=Group),alpha=0.7)+
+  #add text annotations for annual change
+  geom_text(aes(x=year+0.5,y=n_case,label=paste0(round(chg_n),"%"),vjust=-0.6,color=Group),size=3)+
+  #reduced x
+  scale_x_continuous(limits=c(2014.5,2023), breaks=seq(2015,2023,1), expand=c(0,0))+
+  scale_y_continuous(limits=c(0,ymax.new), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.9)),
+        legend.position=c(0.98,0.95), legend.justification = c(1,1))+
+  labs(x=NULL, y="Annual new HIV cases")+
+  pubTheme+
+  scale_color_manual(values=riskcolz)
+
+p.cases.allandrisk.lessx
+ggsave(paste0(f.out,"/p.cases.allandrisk.annot.lessx.png"),width=5,height=4,units="in")
+```
+
+
+# Estimate Re for all of BC - ONLY RUN THIS IF HAVENT ALREADY
+```{r}
+# #use farv dt as date of infection, with any prev_ARV removed
+# Rt_df<-newARV
+# colnames(Rt_df)<-c("dates","I")
+# 
+# Rt_df$dates<-as.Date(Rt_df$dates)
+# 
+# #Fill in missing dates (need a row for every day in between new cases)
+# dates.vector<-as.Date( as.Date(first(sort(Rt_df$dates))):as.Date(last(sort(Rt_df$dates))),origin="1970-01-01")
+# newcases2<-data.frame(dates=dates.vector, I=0)
+# for (i in 1:nrow(Rt_df)){
+#   if (Rt_df$I[i]>0){
+#     match<-which(newcases2$dates==Rt_df$dates[i])
+#     newcases2$I[match]<-Rt_df$I[i]
+#   }
+# }
+# 
+# ## SET OF PARAMETERS TO TRY
+# mean.si.set<-c(floor(365/2), 365, 2*365, 5*365) #0.5, 1, 2, 5 years
+# std.si.set<-c(floor(365/2),365, 2*365) # 0.5, 1, 2 years
+# int.set<-c(floor(365/4), floor(365/2), 365) #0.25, 0.5, 1 year 
+# 
+# ## all combinations
+# param.set<-expand_grid(mean.si.set,std.si.set,int.set)
+# 
+# ## LOOP across all param sets
+# for (k in 1:nrow(param.set)){
+#   mean.si<-param.set$mean.si.set[k]
+#   std.si<-param.set$std.si.set[k]
+#   int<-param.set$int.set[k]
+#   
+#   #Setup intervals
+#   T <- nrow(newcases2)
+#   t_start <- seq(2, T-int) # starting at 2 as conditional on the past observations
+#   t_end <- t_start + int # adding interval sized windows as bounds included in window
+#   
+#   #configure serial interval
+#   config <- make_config(list(t_start=t_start,t_end=t_end,
+#                              mean_si = mean.si, 
+#                             std_si = std.si))
+#   
+#   res_param_si<-EpiEstim::estimate_R(newcases2, 
+#                                 method="parametric_si",
+#                                 config = config)
+#   
+#   #serial interval
+#   plot(res_param_si,"SI")
+#   ggsave(paste0(f.out.re,"/BC_SI_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #Re plot
+#   plot(res_param_si, legend = FALSE, "R")
+#   ggsave(paste0(f.out.re,"/BC_Re_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #convert t start and end to dates
+#   start=as.Date(newcases2$dates[1])
+#   R_df<-res_param_si$R
+#   R_df$date_start<-start+as.numeric(R_df$t_start)
+#   R_df$date_end<-start+as.numeric(R_df$t_end)
+# 
+#   # Export 
+#   write.csv(R_df, paste0(f.out.re,"/Rt_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+#   
+#   ## Plot BC Re over time, RAWW
+#   R_df %>%
+#     ggplot()+
+#     geom_line(aes(x=date_start, y=`Mean(R)`), color="darkblue")+
+#     #ADD quantiles
+#     geom_ribbon(aes(x=date_start,ymin=`Quantile.0.05(R)`,ymax=`Quantile.0.95(R)`),fill="darkblue",alpha=0.25)+
+#     geom_hline(yintercept = 1,color="red4",linetype=3)+
+#     labs(y="Re",x=NULL)+
+#     scale_x_date(date_breaks = "12 months", date_labels = "%b %Y")+
+#     pubTheme+
+#     theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+#     #save it
+#     ggsave(paste0(f.out.re,"/Rt_mean",mean.si,"_std",std.si,"_int",int,".png"),height=4,width=6)
+#   
+# }
+
+```
+
+## make a composite figure of Rt estimated in multiple ways
+```{r}
+# read in all of the data exported most recently into a list
+Re.files<-list.files(path =Re.all.in, pattern="csv",full.names = T)
+all.re<-replicate(n=length(Re.files), vector())
+
+for (i in 1:length(Re.files)){
+  # read and format
+  all.re[[i]]<-read.csv(Re.files[i])
+  all.re[[i]]$date_start<-as.Date(all.re[[i]]$date_start)
+  
+  # smooth them all (k=365, right align)
+  all.re[[i]]$meanR_smooth<-zoo::rollmean(all.re[[i]]$`Mean.R.`,k=365 ,align="right",fill = NA)
+  all.re[[i]]$medianR_smooth<-zoo::rollmean(all.re[[i]]$`Median.R.`,k=365 ,align="right",fill = NA)
+
+  all.re[[i]]$quant0.025_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.025.R.`,k=365 ,align="right",fill = NA)
+  all.re[[i]]$quant0.975_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.975.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.05_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.05.R.`,k=365 ,align="right",fill = NA)
+  all.re[[i]]$quant0.95_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.95.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.25_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.25.R.`,k=365 ,align="right",fill = NA)
+  all.re[[i]]$quant0.75_smooth<-zoo::rollmean(all.re[[i]]$`Quantile.0.75.R.`,k=365 ,align="right",fill = NA)
+  
+  # smooth them again, less (k=90, right align)
+  all.re[[i]]$meanR_smooth90<-zoo::rollmean(all.re[[i]]$`Mean.R.`,k=90 ,align="right",fill = NA)
+  all.re[[i]]$medianR_smooth90<-zoo::rollmean(all.re[[i]]$`Median.R.`,k=90 ,align="right",fill = NA)
+
+  all.re[[i]]$quant0.025_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.025.R.`,k=90 ,align="right",fill = NA)
+  all.re[[i]]$quant0.975_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.975.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.05_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.05.R.`,k=90 ,align="right",fill = NA)
+  all.re[[i]]$quant0.95_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.95.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.25_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.25.R.`,k=90 ,align="right",fill = NA)
+  all.re[[i]]$quant0.75_smooth90<-zoo::rollmean(all.re[[i]]$`Quantile.0.75.R.`,k=90 ,align="right",fill = NA)
+  
+  
+  # smooth them again, less (k=30, right align)
+  all.re[[i]]$meanR_smooth30<-zoo::rollmean(all.re[[i]]$`Mean.R.`,k=30 ,align="right",fill = NA)
+  all.re[[i]]$medianR_smooth30<-zoo::rollmean(all.re[[i]]$`Median.R.`,k=30 ,align="right",fill = NA)
+
+  all.re[[i]]$quant0.025_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.025.R.`,k=30 ,align="right",fill = NA)
+  all.re[[i]]$quant0.975_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.975.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.05_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.05.R.`,k=30 ,align="right",fill = NA)
+  all.re[[i]]$quant0.95_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.95.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re[[i]]$quant0.25_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.25.R.`,k=30 ,align="right",fill = NA)
+  all.re[[i]]$quant0.75_smooth30<-zoo::rollmean(all.re[[i]]$`Quantile.0.75.R.`,k=30 ,align="right",fill = NA)
+  
+  # add params as a column
+  all.re[[i]]$paramset<-str_replace_all(unlist(str_split(Re.files[[i]],"//"))[[2]],".csv|Rt_","")
+}
+
+# bind_row them all
+all.re.df<-bind_rows(all.re)
+
+#order nicely
+params<-unique(all.re.df$paramset)
+last<-str_which(params,"mean1825")
+params<-params[c(1:(last[1]-1), (last(last)+1):length(params), last)]
+all.re.df$paramset<-factor(all.re.df$paramset, levels=params)
+
+#Make a separated paramset
+all.re.df<-all.re.df %>% separate(col=paramset,sep="_",into=LETTERS[1:3],remove = F)
+all.re.df$A<-factor(all.re.df$A, levels=c("mean182","mean365","mean730","mean1825"))
+all.re.df$C<-factor(all.re.df$C, levels=c("int91","int182","int365"))
+```
+
+## plot overlaid with colors for paramset
+```{r}
+# max(all.re.df$Quantile.0.75.R., na.rm = T)
+ymax.re<-2.4
+
+all.re.df %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth, group=paramset, color=paramset))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth, fill=paramset),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(0,ymax.re))+
+  guides(color=guide_legend(nrow=9,title.position = "top", title="Serial interval parameters"),
+         fill=guide_legend(nrow=9,title.position = "top", title="Serial interval parameters"))
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI.png"),height=6,width=7)
+
+```
+
+## Plot as facet_grid by mean and stdev of serial interval
+```{r}
+ymin<-0.25
+ymax.re2<-1.5
+#as before, but facetted
+all.re.df %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin,ymax.re2))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI_2012-pres_FACET_smooth365.png"),height=8,width=8.5)
+
+# repeat this plot for the whole time frame
+ymax.re3<-2.2
+ymin3<-0.2
+all.re.df %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin3,ymax.re3))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI_1998-pres_FACET_smooth365.png"),height=8,width=8.5)
+
+```
+
+## Make a simplified plot of middle-ground parameters for smooth 365
+```{r}
+ymin4<-0.5
+ymax4<-1.5
+all.re.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_focal-paramset_95CI_1998-pres.png"),height=5,width=4)
+
+## AGAIN for 2012 to pres
+ymin4<-0.5
+ymax4<-1.5
+all.re.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth, ymax=quant0.95_smooth),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_focal-paramset_95CI_2012-pres.png"),height=5,width=4)
+```
+
+## compare to different smoothing parameters: 90 and 30, none
+```{r}
+#30 smoothing
+all.re.df %>%
+  ggplot()+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth30, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth30, ymax=quant0.95_smooth30, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin,ymax.re2))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI_2012-pres_FACET_smooth30.png"),height=8,width=8.5)
+
+
+#90 smoothing
+all.re.df %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin,ymax.re2))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI_2012-pres_FACET_smooth90.png"),height=8,width=8.5)
+
+#NO smoothing
+all.re.df %>%
+  ggplot()+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=Mean.R., group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=Quantile.0.05.R., ymax=Quantile.0.95.R., fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin,ymax.re2))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_multi-paramset_95CI_2012-pres_FACET_NO-smooth.png"),height=8,width=8.5)
+
+```
+
+# RE of RISK GROUPS - ONLY RUN IF HAVENT ALREADY
+#GBM
+```{r}
+
+# ## Calculate the Re for MSM
+# Rt_df.m<-dtp.m %>% 
+#   dplyr::group_by(FARVDT) %>% 
+#   dplyr::summarize(count=n()) %>%
+#   as.data.frame()
+# colnames(Rt_df.m)<-c("dates","I")
+# 
+# Rt_df.m$dates<-as.Date(Rt_df.m$dates)
+# 
+# #Fill in missing dates (need a row for every day in between new cases)
+# dates.vector<-as.Date( as.Date(first(sort(Rt_df.m$dates))):as.Date(last(sort(Rt_df.m$dates))),origin="1970-01-01")
+# newcases.m<-data.frame(dates=dates.vector, I=0)
+# for (i in 1:nrow(Rt_df.m)){
+#   if (Rt_df.m$I[i]>0){
+#     match<-which(newcases.m$dates==Rt_df.m$dates[i])
+#     newcases.m$I[match]<-Rt_df.m$I[i]
+#   }
+# }
+# 
+# #use paramset from above
+# 
+# ## LOOP across all param sets
+# for (k in 1:nrow(param.set)){
+#   mean.si<-param.set$mean.si.set[k]
+#   std.si<-param.set$std.si.set[k]
+#   int<-param.set$int.set[k]
+#   
+#   #Setup intervals
+#   T <- nrow(newcases.m)
+#   t_start <- seq(2, T-int) # starting at 2 as conditional on the past observations
+#   t_end <- t_start + int # adding interval sized windows as bounds included in window
+#   
+#   #configure serial interval
+#   config <- make_config(list(t_start=t_start,t_end=t_end,
+#                              mean_si = mean.si, 
+#                             std_si = std.si))
+#   
+#   res_param_si<-EpiEstim::estimate_R(newcases.m, 
+#                                 method="parametric_si",
+#                                 config = config)
+#   
+#   #serial interval
+#   plot(res_param_si,"SI")
+#   ggsave(paste0(f.out.rsk,"/MSM_SI_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #Re plot
+#   plot(res_param_si, legend = FALSE, "R")
+#   ggsave(paste0(f.out.rsk,"/MSM_Re_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #convert t start and end to dates
+#   start=as.Date(newcases.m$dates[1])
+#   R_df.m<-res_param_si$R
+#   R_df.m$date_start<-start+as.numeric(R_df.m$t_start)
+#   R_df.m$date_end<-start+as.numeric(R_df.m$t_end)
+# 
+#   # Export 
+#   write.csv(R_df.m, paste0(f.out.rsk,"/Rt_msm_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+#   
+#   ## Plot big clusters' Re over time
+#   R_df.m %>%
+#     ggplot()+
+#     geom_line(aes(x=date_start, y=`Mean(R)`), color="darkblue")+
+#     #ADD quantiles
+#     geom_ribbon(aes(x=date_start,ymin=`Quantile.0.05(R)`,ymax=`Quantile.0.95(R)`),fill="darkblue",alpha=0.25)+
+#     geom_hline(yintercept = 1,color="red4",linetype=3)+
+#     labs(y="Re",x=NULL)+
+#     scale_x_date(date_breaks = "12 months", date_labels = "%b %Y")+
+#     pubTheme+
+#     theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+#     #save it
+#     ggsave(paste0(f.out.rsk,"/Rt_msm_mean",mean.si,"_std",std.si,"_int",int,".png"),height=4,width=6)
+#   
+# }
+
+```
+
+## Calculate the Re for PWID
+```{r}
+## PWID
+# Rt_df.i<-dtp.i %>% 
+#   dplyr::group_by(FARVDT) %>% 
+#   dplyr::summarize(count=n()) %>%
+#   as.data.frame()
+# colnames(Rt_df.i)<-c("dates","I")
+# 
+# Rt_df.i$dates<-as.Date(Rt_df.i$dates)
+# 
+# #Fill in missing dates (need a row for every day in between new cases)
+# dates.vector<-as.Date( as.Date(first(sort(Rt_df.i$dates))):as.Date(last(sort(Rt_df.i$dates))),origin="1970-01-01")
+# newcases.i<-data.frame(dates=dates.vector, I=0)
+# for (i in 1:nrow(Rt_df.i)){
+#   if (Rt_df.i$I[i]>0){
+#     match<-which(newcases.i$dates==Rt_df.i$dates[i])
+#     newcases.i$I[match]<-Rt_df.i$I[i]
+#   }
+# }
+# 
+# #use paramset from above
+# 
+# ## LOOP across all param sets
+# for (k in 1:nrow(param.set)){
+#   mean.si<-param.set$mean.si.set[k]
+#   std.si<-param.set$std.si.set[k]
+#   int<-param.set$int.set[k]
+#   
+#   #Setup intervals
+#   T <- nrow(newcases.i)
+#   t_start <- seq(2, T-int) # starting at 2 as conditional on the past observations
+#   t_end <- t_start + int # adding interval sized windows as bounds included in window
+#   
+#   #configure serial interval
+#   config <- make_config(list(t_start=t_start,t_end=t_end,
+#                              mean_si = mean.si, 
+#                             std_si = std.si))
+#   
+#   res_param_si<-EpiEstim::estimate_R(newcases.i, 
+#                                 method="parametric_si",
+#                                 config = config)
+#   
+#   #serial interval
+#   plot(res_param_si,"SI")
+#   ggsave(paste0(f.out.rsk,"/PWID_SI_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #Re plot
+#   plot(res_param_si, legend = FALSE, "R")
+#   ggsave(paste0(f.out.rsk,"/PWID_Re_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #convert t start and end to dates
+#   start=as.Date(newcases.i$dates[1])
+#   R_df.i<-res_param_si$R
+#   R_df.i$date_start<-start+as.numeric(R_df.i$t_start)
+#   R_df.i$date_end<-start+as.numeric(R_df.i$t_end)
+# 
+#   # Export 
+#   write.csv(R_df.i, paste0(f.out.rsk,"/Rt_PWID_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+#   
+#   ## Plot big clusters' Re over time
+#   R_df.i %>%
+#     ggplot()+
+#     geom_line(aes(x=date_start, y=`Mean(R)`), color="darkblue")+
+#     #ADD quantiles
+#     geom_ribbon(aes(x=date_start,ymin=`Quantile.0.05(R)`,ymax=`Quantile.0.95(R)`),fill="darkblue",alpha=0.25)+
+#     geom_hline(yintercept = 1,color="red4",linetype=3)+
+#     labs(y="Re",x=NULL)+
+#     scale_x_date(date_breaks = "12 months", date_labels = "%b %Y")+
+#     pubTheme+
+#     theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+#     #save it
+#     ggsave(paste0(f.out.rsk,"/Rt_PWID_mean",mean.si,"_std",std.si,"_int",int,".png"),height=4,width=6)
+#   
+# }
+
+```
+
+
+## Calculate Rt for HET
+```{r}
+# ## HET
+# Rt_df.h<-dtp.h %>% 
+#   dplyr::group_by(FARVDT) %>% 
+#   dplyr::summarize(count=n()) %>%
+#   as.data.frame()
+# colnames(Rt_df.h)<-c("dates","I")
+# 
+# Rt_df.h$dates<-as.Date(Rt_df.h$dates)
+# 
+# #Fill in missing dates (need a row for every day in between new cases)
+# dates.vector<-as.Date( as.Date(first(sort(Rt_df.h$dates))):as.Date(last(sort(Rt_df.h$dates))),origin="1970-01-01")
+# newcases.h<-data.frame(dates=dates.vector, I=0)
+# for (i in 1:nrow(Rt_df.h)){
+#   if (Rt_df.h$I[i]>0){
+#     match<-which(newcases.h$dates==Rt_df.h$dates[i])
+#     newcases.h$I[match]<-Rt_df.h$I[i]
+#   }
+# }
+# 
+# #use paramset from above
+# 
+# ## LOOP across all param sets
+# for (k in 1:nrow(param.set)){
+#   mean.si<-param.set$mean.si.set[k]
+#   std.si<-param.set$std.si.set[k]
+#   int<-param.set$int.set[k]
+#   
+#   #Setup intervals
+#   T <- nrow(newcases.h)
+#   t_start <- seq(2, T-int) # starting at 2 as conditional on the past observations
+#   t_end <- t_start + int # adding interval sized windows as bounds included in window
+#   
+#   #configure serial interval
+#   config <- make_config(list(t_start=t_start,t_end=t_end,
+#                              mean_si = mean.si, 
+#                             std_si = std.si))
+#   
+#   res_param_si<-EpiEstim::estimate_R(newcases.h, 
+#                                 method="parametric_si",
+#                                 config = config)
+#   
+#   #serial interval
+#   plot(res_param_si,"SI")
+#   ggsave(paste0(f.out.rsk,"/HET_SI_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #Re plot
+#   plot(res_param_si, legend = FALSE, "R")
+#   ggsave(paste0(f.out.rsk,"/HET_Re_mean",mean.si,"_std",std.si,"_int",int,".png"),width=5,height=4)
+#   
+#   #convert t start and end to dates
+#   start=as.Date(newcases.h$dates[1])
+#   R_df.h<-res_param_si$R
+#   R_df.h$date_start<-start+as.numeric(R_df.h$t_start)
+#   R_df.h$date_end<-start+as.numeric(R_df.h$t_end)
+# 
+#   # Export 
+#   write.csv(R_df.h, paste0(f.out.rsk,"/Rt_HET_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+#   
+#   ## Plot big clusters' Re over time
+#   R_df.h %>%
+#     ggplot()+
+#     geom_line(aes(x=date_start, y=`Mean(R)`), color="darkblue")+
+#     #ADD quantiles
+#     geom_ribbon(aes(x=date_start,ymin=`Quantile.0.05(R)`,ymax=`Quantile.0.95(R)`),fill="darkblue",alpha=0.25)+
+#     geom_hline(yintercept = 1,color="red4",linetype=3)+
+#     labs(y="Re",x=NULL)+
+#     scale_x_date(date_breaks = "12 months", date_labels = "%b %Y")+
+#     pubTheme+
+#     theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+#     #save it
+#     ggsave(paste0(f.out.rsk,"/Rt_HET_mean",mean.si,"_std",std.si,"_int",int,".png"),height=4,width=6)
+# }
+```
+
+
+## Rt estimated in multiple ways, MSM
+```{r}
+# read in all of the data into a list
+Re.files.rsk<-list.files(path =Re.rsk.in, pattern=".csv",full.names = T)
+Re.files<-Re.files.rsk[str_which(Re.files.rsk, "msm")]
+
+all.re.m<-replicate(n=length(Re.files), vector())
+
+for (i in 1:length(Re.files)){
+  # read and format
+  all.re.m[[i]]<-read.csv(Re.files[i])
+  all.re.m[[i]]$date_start<-as.Date(all.re.m[[i]]$date_start)
+  
+  # smooth them all (k=365, right align)
+  all.re.m[[i]]$meanR_smooth<-zoo::rollmean(all.re.m[[i]]$`Mean.R.`,k=365 ,align="right",fill = NA)
+  all.re.m[[i]]$medianR_smooth<-zoo::rollmean(all.re.m[[i]]$`Median.R.`,k=365 ,align="right",fill = NA)
+
+  all.re.m[[i]]$quant0.025_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.025.R.`,k=365 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.975_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.975.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.05_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.05.R.`,k=365 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.95_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.95.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.25_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.25.R.`,k=365 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.75_smooth<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.75.R.`,k=365 ,align="right",fill = NA)
+  
+  # smooth them again, less (k=90, right align)
+  all.re.m[[i]]$meanR_smooth90<-zoo::rollmean(all.re.m[[i]]$`Mean.R.`,k=90 ,align="right",fill = NA)
+  all.re.m[[i]]$medianR_smooth90<-zoo::rollmean(all.re.m[[i]]$`Median.R.`,k=90 ,align="right",fill = NA)
+
+  all.re.m[[i]]$quant0.025_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.025.R.`,k=90 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.975_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.975.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.05_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.05.R.`,k=90 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.95_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.95.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.25_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.25.R.`,k=90 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.75_smooth90<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.75.R.`,k=90 ,align="right",fill = NA)
+  
+  
+  # smooth them again, less (k=30, right align)
+  all.re.m[[i]]$meanR_smooth30<-zoo::rollmean(all.re.m[[i]]$`Mean.R.`,k=30 ,align="right",fill = NA)
+  all.re.m[[i]]$medianR_smooth30<-zoo::rollmean(all.re.m[[i]]$`Median.R.`,k=30 ,align="right",fill = NA)
+
+  all.re.m[[i]]$quant0.025_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.025.R.`,k=30 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.975_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.975.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.05_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.05.R.`,k=30 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.95_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.95.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.m[[i]]$quant0.25_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.25.R.`,k=30 ,align="right",fill = NA)
+  all.re.m[[i]]$quant0.75_smooth30<-zoo::rollmean(all.re.m[[i]]$`Quantile.0.75.R.`,k=30 ,align="right",fill = NA)
+  
+  # add params as a column
+  all.re.m[[i]]$paramset<-str_replace_all(unlist(str_split(Re.files[[i]],"//"))[[2]],".csv|Rt_msm_","")
+}
+
+# bind_row them all
+all.re.m.df<-bind_rows(all.re.m)
+
+#order nicely
+params<-unique(all.re.m.df$paramset)
+last<-str_which(params,"mean1825")
+params<-params[c(1:(last[1]-1), (last(last)+1):length(params), last)]
+all.re.m.df$paramset<-factor(all.re.m.df$paramset, levels=params)
+
+#make groups
+all.re.m.df<-all.re.m.df %>% separate(col=paramset,sep="_",into=LETTERS[1:3],remove = F)
+all.re.m.df$A<-factor(all.re.m.df$A, levels=c("mean182","mean365","mean730","mean1825"))
+all.re.m.df$C<-factor(all.re.m.df$C, levels=c("int91","int182","int365"))
+```
+
+## Plot focal Re for MSM paramset
+```{r}
+empty<-which(is.na(all.re.m.df$C))
+if(length(empty)>0){all.re.m.df<-all.re.m.df[-empty,]}
+#facetted and smootheda
+ymin.m<-0.2
+ymax.m<-2.5
+all.re.m.df %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, GBM BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin.m,ymax.m))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_MSM_multi-paramset_95CI_2012-pres_FACET_smooth90.png"),height=7,width=8.5)
+
+# repeat this plot for the whole time frame
+# ymax.re3<-3.2
+# ymin3<-0.2
+# all.re.m.df %>%
+#   ggplot()+
+#     #vertical line/annotation for PREP wide available
+#   geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+#   annotate(geom="text", x = as.Date("2018-01-01"),
+#            y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+#   #vertical line/annotation for COVID-19
+#   geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+#   annotate(geom="text", x = as.Date("2020-03-01"),
+#            y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+#   #vertical line for post-COVID-19 2022-onwards
+#   geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+#   # annotate(geom="text", x = as.Date("2022-01-01"),
+#   #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+#            
+#   geom_line(aes(x=date_start, y=meanR_smooth, group=C, color=C))+
+#   geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90, fill=C),alpha=0.1)+
+#   pubTheme+
+#   geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+#   labs(x=NULL, y="Re, GBM BC")+
+#   scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+#                limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+#   theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+#         legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+#   scale_y_continuous(expand=c(0,0), limits=c(ymin3,ymax.re3))+
+#   guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+#          fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+#   facet_grid(B ~ A, scales="fixed")
+# ggsave(paste0(f.out,"/Rt_MSM_multi-paramset_95CI_1998-pres_FACET_smooth90.png"),height=8,width=8.5)
+
+## Make a simplified plot of middle-ground parameters
+ymin4<-0.25
+ymax4<-2
+all.re.m.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, GBM BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_MSM_focal-paramset_95CI_1998-pres_smooth90.png"),height=5,width=4)
+
+## AGAIN for 2012 to pres
+ymin4<-0.25
+ymax4<-2.1
+all.re.m.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, GBM BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_MSM_focal-paramset_95CI_2012-pres_smooth90.png"),height=3,width=4)
+```
+
+## Rt estimated in multiple ways PWID
+```{r}
+# read in all of the data into a list
+# Re.files<-list.files(path = paste0(today,"_Results/Re_RskGrp/"),pattern="csv",full.names = T)
+Re.files<-Re.files.rsk[str_which(Re.files.rsk, "PWID")]
+# Re.files<-list.files(path = "2023-11-14_Results/Re",pattern="csv",full.names = T)
+
+all.re.i<-replicate(n=length(Re.files), vector())
+
+for (i in 1:length(Re.files)){
+  # read and format
+  all.re.i[[i]]<-read.csv(Re.files[i])
+  all.re.i[[i]]$date_start<-as.Date(all.re.i[[i]]$date_start)
+  
+  # smooth them all (k=365, right align)
+  all.re.i[[i]]$meanR_smooth<-zoo::rollmean(all.re.i[[i]]$`Mean.R.`,k=365 ,align="right",fill = NA)
+  all.re.i[[i]]$medianR_smooth<-zoo::rollmean(all.re.i[[i]]$`Median.R.`,k=365 ,align="right",fill = NA)
+
+  all.re.i[[i]]$quant0.025_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.025.R.`,k=365 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.975_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.975.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.05_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.05.R.`,k=365 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.95_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.95.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.25_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.25.R.`,k=365 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.75_smooth<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.75.R.`,k=365 ,align="right",fill = NA)
+  
+  # smooth them again, less (k=90, right align)
+  all.re.i[[i]]$meanR_smooth90<-zoo::rollmean(all.re.i[[i]]$`Mean.R.`,k=90 ,align="right",fill = NA)
+  all.re.i[[i]]$medianR_smooth90<-zoo::rollmean(all.re.i[[i]]$`Median.R.`,k=90 ,align="right",fill = NA)
+
+  all.re.i[[i]]$quant0.025_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.025.R.`,k=90 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.975_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.975.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.05_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.05.R.`,k=90 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.95_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.95.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.25_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.25.R.`,k=90 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.75_smooth90<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.75.R.`,k=90 ,align="right",fill = NA)
+  
+  
+  # smooth them again, less (k=30, right align)
+  all.re.i[[i]]$meanR_smooth30<-zoo::rollmean(all.re.i[[i]]$`Mean.R.`,k=30 ,align="right",fill = NA)
+  all.re.i[[i]]$medianR_smooth30<-zoo::rollmean(all.re.i[[i]]$`Median.R.`,k=30 ,align="right",fill = NA)
+
+  all.re.i[[i]]$quant0.025_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.025.R.`,k=30 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.975_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.975.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.05_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.05.R.`,k=30 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.95_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.95.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.i[[i]]$quant0.25_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.25.R.`,k=30 ,align="right",fill = NA)
+  all.re.i[[i]]$quant0.75_smooth30<-zoo::rollmean(all.re.i[[i]]$`Quantile.0.75.R.`,k=30 ,align="right",fill = NA)
+  
+  # add params as a column
+  all.re.i[[i]]$paramset<-str_replace_all(unlist(str_split(Re.files[[i]],"//"))[[2]],".csv|Rt_PWID_","")
+}
+
+# bind_row them all
+all.re.i.df<-bind_rows(all.re.i)
+
+
+#order nicely
+params<-unique(all.re.i.df$paramset)
+last<-str_which(params,"mean1825")
+params<-params[c(1:(last[1]-1), (last(last)+1):length(params), last)]
+all.re.i.df$paramset<-factor(all.re.i.df$paramset, levels=params)
+
+#make groups
+all.re.i.df<-all.re.i.df %>% separate(col=paramset,sep="_",into=LETTERS[1:3],remove = F)
+all.re.i.df$A<-factor(all.re.i.df$A, levels=c("mean182","mean365","mean730","mean1825"))
+all.re.i.df$C<-factor(all.re.i.df$C, levels=c("int91","int182","int365"))
+
+```
+
+## Plot Re for PWID paramset
+```{r}
+empty<-which(is.na(all.re.i.df$C))
+if(length(empty)>0){all.re.i.df<-all.re.i.df[-empty,]}
+
+#facetted and smoothed
+ymin.i<-0.25
+ymax.i<-2.5
+all.re.i.df %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90, group=C, color=C))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90, fill=C),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, PWID BC")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin.i,ymax.i))+
+  guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+         fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+  facet_grid(B ~ A, scales="fixed")
+ggsave(paste0(f.out,"/Rt_PWID_multi-paramset_95CI_2012-pres_FACET_smooth90.png"),height=6,width=8.5)
+
+# repeat this plot for the whole time frame
+# ymax.re3<-3.2
+# ymin3<-0.2
+# all.re.i.df %>%
+#   ggplot()+
+#    #vertical line/annotation for PREP wide available
+#   geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+#   annotate(geom="text", x = as.Date("2018-01-01"),
+#            y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+#   #vertical line/annotation for COVID-19
+#   geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+#   annotate(geom="text", x = as.Date("2020-03-01"),
+#            y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+#   #vertical line for post-COVID-19 2022-onwards
+#   geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+#   # annotate(geom="text", x = as.Date("2022-01-01"),
+#   #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+#            
+#   geom_line(aes(x=date_start, y=meanR_smooth90, group=C, color=C))+
+#   geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90, fill=C),alpha=0.1)+
+#   pubTheme+
+#   geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+#   labs(x=NULL, y="Re, PWID BC")+
+#   scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+#                limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+#   theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+#         legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+#   scale_y_continuous(expand=c(0,0), limits=c(ymin3,ymax.re3))+
+#   guides(color=guide_legend(nrow=1,title.position = "left", title="Estimate interval"),
+#          fill=guide_legend(nrow=1,title.position = "left", title="Estimate interval"))+
+#   facet_grid(B ~ A, scales="fixed")
+# ggsave(paste0(f.out,"/Rt_PWID_multi-paramset_95CI_1998-pres_FACET_smooth90.png"),height=8,width=8.5)
+
+## Make a simplified plot of middle-ground parameters
+ymin4<-0.5
+ymax4<-1.7
+all.re.i.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+   #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, PWID BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("1998-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_PWID_focal-paramset_95CI_1998-pres_90.png"),height=5,width=4)
+
+## AGAIN for 2012 to pres
+ymin4<-0.25
+ymax4<-2.1
+all.re.i.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, PWID BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), limits=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_PWID_focal-paramset_95CI_2012-pres_90.png"),height=3,width=4)
+```
+
+## Rt estimated in multiple ways, HET
+```{r}
+# read in all of the data into a list
+# Re.files<-list.files(path = paste0(today,"_Results/Re_RskGrp/"),pattern="csv",full.names = T)
+Re.files<-Re.files.rsk[str_which(Re.files.rsk, "HET")]
+
+all.re.h<-replicate(n=length(Re.files), vector())
+
+for (i in 1:length(Re.files)){
+  # read and format
+  all.re.h[[i]]<-read.csv(Re.files[i])
+  all.re.h[[i]]$date_start<-as.Date(all.re.h[[i]]$date_start)
+  
+  # smooth them all (k=365, right align)
+  all.re.h[[i]]$meanR_smooth<-zoo::rollmean(all.re.h[[i]]$`Mean.R.`,k=365 ,align="right",fill = NA)
+  all.re.h[[i]]$medianR_smooth<-zoo::rollmean(all.re.h[[i]]$`Median.R.`,k=365 ,align="right",fill = NA)
+
+  all.re.h[[i]]$quant0.025_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.025.R.`,k=365 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.975_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.975.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.05_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.05.R.`,k=365 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.95_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.95.R.`,k=365 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.25_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.25.R.`,k=365 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.75_smooth<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.75.R.`,k=365 ,align="right",fill = NA)
+  
+  # smooth them again, less (k=90, right align)
+  all.re.h[[i]]$meanR_smooth90<-zoo::rollmean(all.re.h[[i]]$`Mean.R.`,k=90 ,align="right",fill = NA)
+  all.re.h[[i]]$medianR_smooth90<-zoo::rollmean(all.re.h[[i]]$`Median.R.`,k=90 ,align="right",fill = NA)
+
+  all.re.h[[i]]$quant0.025_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.025.R.`,k=90 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.975_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.975.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.05_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.05.R.`,k=90 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.95_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.95.R.`,k=90 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.25_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.25.R.`,k=90 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.75_smooth90<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.75.R.`,k=90 ,align="right",fill = NA)
+  
+  
+  # smooth them again, less (k=30, right align)
+  all.re.h[[i]]$meanR_smooth30<-zoo::rollmean(all.re.h[[i]]$`Mean.R.`,k=30 ,align="right",fill = NA)
+  all.re.h[[i]]$medianR_smooth30<-zoo::rollmean(all.re.h[[i]]$`Median.R.`,k=30 ,align="right",fill = NA)
+
+  all.re.h[[i]]$quant0.025_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.025.R.`,k=30 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.975_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.975.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.05_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.05.R.`,k=30 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.95_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.95.R.`,k=30 ,align="right",fill = NA)
+  
+  all.re.h[[i]]$quant0.25_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.25.R.`,k=30 ,align="right",fill = NA)
+  all.re.h[[i]]$quant0.75_smooth30<-zoo::rollmean(all.re.h[[i]]$`Quantile.0.75.R.`,k=30 ,align="right",fill = NA)
+  
+  # add params as a column
+  all.re.h[[i]]$paramset<-str_replace_all(unlist(str_split(Re.files[[i]],"//"))[[2]],".csv|Rt_HET_","")
+}
+
+# bind_row them all
+all.re.h.df<-bind_rows(all.re.h)
+
+all.re.h.df$paramset<-str_replace_all(all.re.h.df$paramset, "Rt_HET_","")
+
+```
+## summary plot HET midleground param only
+```{r}
+## AGAIN for 2012 to pres
+ymin4<-0.25
+ymax4<-2.1
+all.re.h.df %>%
+  filter(paramset=="mean365_std182_int182") %>%
+  ggplot()+
+    #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax.new,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90))+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90),alpha=0.1)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Re, HET BC")+
+  scale_x_date(date_breaks="24 months",date_labels = "%Y", 
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "bottom", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0), )+
+  coord_cartesian(ylim=c(ymin4,ymax4))
+ggsave(paste0(f.out,"/Rt_HET_focal-paramset_95CI_2012-pres_smooth90.png"),height=3,width=4)
+```
+
+## write these df
+```{r}
+write.csv(all.re.h.df,paste0(f.out.rsk,"/all.re.het.df.csv"))
+write.csv(all.re.i.df,paste0(f.out.rsk,"/all.re.pwid.df.csv"))
+write.csv(all.re.m.df,paste0(f.out.rsk,"/all.re.msm.df.csv"))
+write.csv(all.re.df,paste0(f.out.rsk,"/all.re.all.df.csv"))
+
+#could read these in and start here
+```
+
+
+## for a single paramset, estimate Rt for MSM, PWID, and HET - then output in same plot - REWORK TO MULTIPLE RISKs
+```{r}
+#assuming that the above has been run, can just pull this out of the respective datasets for overall and group specific
+paramset.foc<-"mean365_std182_int91"
+
+focal.re.h.df<-all.re.h.df %>% filter(paramset==paramset.foc) %>% filter(date_start>=as.Date("2012-01-01"))
+focal.re.h.df$Group<-"HET"
+focal.re.i.df<-all.re.i.df %>% filter(paramset==paramset.foc) %>% filter(date_start>=as.Date("2012-01-01"))
+focal.re.i.df$Group<-"PWID"
+focal.re.m.df<-all.re.m.df %>% filter(paramset==paramset.foc) %>% filter(date_start>=as.Date("2012-01-01"))
+focal.re.m.df$Group<-"GBM"
+focal.re.df<-all.re.df %>% filter(paramset==paramset.foc) %>% filter(date_start>=as.Date("2012-01-01"))
+focal.re.df$Group<-"All"
+
+#bind together
+focal.re.df$date_start<-as.Date(focal.re.df$date_start)
+# focal.re.df$date_end<-as.Date(focal.re.df$date_end)
+focal.re.s<-bind_rows(focal.re.h.df, focal.re.i.df, focal.re.m.df, focal.re.df)
+table(focal.re.s$Group)
+#order the Groups
+focal.re.s$Group<-factor(focal.re.s$Group, levels=names(riskcolz))
+
+#export dat
+write.csv(focal.re.s, paste0(f.out,"/focal.re.allandrisk.csv"))
+
+# plot overlaid
+ymin4<-0.25
+ymax4<-2.5
+p.re.allrisk<-focal.re.s %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax4,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax4,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+  #          y = ymax.new,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+           
+  geom_line(aes(x=date_start, y=meanR_smooth90,color=Group),)+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90,fill=Group),alpha=0.2)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5)+
+  labs(x=NULL, y="Effective reproduction number (Re)")+
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("2012-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "none", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0) )+
+  coord_cartesian(ylim=c(ymin4,ymax4))+  
+  facet_wrap(~Group,scales="free",ncol=1)+
+  scale_color_manual(values=riskcolz)+
+  scale_fill_manual(values=riskcolz)
+  
+  
+p.re.allrisk
+# ggsave(paste0(f.out,"/Rt_focal-param_AllandRisk_95CI_2012-pres_90.png"),height=3,width=8.5)
+
+## make a version with less x-axis
+## and different style annottations as above
+p.re.allrisk.lessx<-focal.re.s %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax4,hjust=-0.01,vjust=0.8, label="PrEP", color="black",size=2)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax4,hjust=-0.01,vjust=0.8, label="COVID-19", color="black",size=2)+
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+
+  #DATA
+  geom_line(aes(x=date_start, y=meanR_smooth90,color=Group),)+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90,fill=Group),alpha=0.2)+
+  pubTheme+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5,alpha=0.7)+
+  labs(x=NULL, y="Effective reproduction number (Re)")+
+  #smaller x
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("2015-01-01"),as.Date("2023-01-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "none", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0))+
+  coord_cartesian(ylim=c(ymin4,ymax4))+  
+  facet_wrap(~Group,scales="fixed",ncol=2)+
+  scale_color_manual(values=riskcolz)+
+  scale_fill_manual(values=riskcolz)
+p.re.allrisk.lessx
+ggsave(paste0(f.out,"/Rt_focal-param_AllandRisk_95CI_2012-pres_90_lessx.png"),height=3,width=8.5)
+
+```
+
+## make a composite of new cases, perc cahnge in new cases, and Rt overall and by risk group = Fig 3 in main manuscript
+```{r}
+# row1<-plot_grid(p.cases.allandrisk,p.chg.perc, labels=LETTERS[1:2],nrow=1)
+# all<-plot_grid(row1, p.re.allrisk, nrow=2, rel_heights=c(1,1), labels=c(NA, "C"), align ="h")
+# all
+# ggsave(paste0(f.out,"/comp_changeNewCases_Rt_AllandRisk_2012_smooth90.png"),height=6,width=8)
+
+#Alt layout
+col1<-plot_grid(p.cases.allandrisk,p.chg.perc, labels=LETTERS[1:2],ncol=1,align="v")
+all<-plot_grid(col1, p.re.allrisk, ncol=2, rel_widths=c(1,1), labels=c(NA, "C"), align ="h")
+all
+ggsave(paste0(f.out,"/comp_changeNewCases_Rt_AllandRisk_2012_smooth90.png"),height=6,width=8.5)
+```
+
+## calculate piecewise averages in the period before prep, with prep/before covid, with prep/during covid, post-covid
+```{r}
+per1<-c("2016-01-01","2017-12-31")
+per2<-c("2018-01-01","2020-02-29")
+per3<-c("2020-03-01","2021-12-31")
+per4<-c("2022-01-01","2023-02-28")
+
+# for each risk group and overall
+table(focal.re.s$Group)
+
+#join period onto rows based on date 
+focal.re.s$period<-NA
+for(i in 1:nrow(focal.re.s)){
+  dt<-as.Date(focal.re.s$date_end[i])-45 #minus 90 to take halfway pt b/w start and end as delineator
+  if(dt<per1[1]){next} #if before 2016, then leave as NA
+  if(dt>=per1[1] & dt<=per1[2]){focal.re.s$period[i]<-"Before PrEP"; next} #if in period 1: beforePrEP
+  if(dt>=per2[1] & dt<=per2[2]){focal.re.s$period[i]<-"During PrEP\npre-COVID-19"; next} 
+  if(dt>=per3[1] & dt<=per3[2]){focal.re.s$period[i]<-"During PrEP\nduring COVID-19"; next} 
+  if(dt>=per4[1] & dt<=per4[2]){focal.re.s$period[i]<-"During PrEP\npost-COVID-19"; next} 
+}
+# table(focal.re.s$period)
+
+periods<-c("Before PrEP","During PrEP\npre-COVID-19","During PrEP\nduring COVID-19","During PrEP\npost-COVID-19")
+focal.re.s$period<-factor(focal.re.s$period, levels=periods)
+focal.re.s2<-focal.re.s
+focal.re.s2<-focal.re.s2 %>% filter(!is.na(focal.re.s$period))
+
+#group by period 
+#calculate piecewise average and stdev for Re in the period, group
+focal.re.s.per<-focal.re.s %>% 
+  dplyr::group_by(Group, period) %>%
+  dplyr::summarise(.groups="rowwise",
+                   medianRe=median(meanR_smooth90,na.rm=T), #TAKE the median of the means
+                   meanRe=mean(meanR_smooth90,na.rm=T),
+                   sdRe=sd(meanR_smooth90,na.rm=T),
+                   
+                   meanquant025=mean(quant0.025_smooth90,na.rm=T),
+                   medianquant025=median(quant0.025_smooth90,na.rm=T),
+                   
+                   meanquant975=mean(quant0.975_smooth90,na.rm=T),
+                   medianquant975=median(quant0.975_smooth90,na.rm=T),) #SD across daily estimates
+focal.re.s.per<-focal.re.s.per %>% filter(!is.na(period))
+
+## make a plot with individual datapoints as violin, and then with overlay boxplots 
+p.re.averages<-ggplot()+
+  geom_violin(data=focal.re.s2, aes(x=period, y=meanR_smooth90,fill=Group), alpha=0.3, width=0.8,
+              position=position_dodge(width = 0.75),lwd=0.1)+
+  # geom_boxplot(data=focal.re.s2, aes(x=period, y=meanR_smooth90,fill=Group, color=Group), width=0.5, alpha=0.3, 
+  #              position=position_dodge(width = 0.75),lwd=0.1)+
+  #Add medians
+  geom_point(data=focal.re.s.per, aes(x=period, y=medianRe,group=Group, color=Group),shape="-",size=7,alpha=0.6,
+                            position=position_dodge(width = 0.75))+
+  scale_fill_manual(values=riskcolz)+
+  scale_color_manual(values=riskcolz)+
+  pubTheme+
+  labs(x=NULL, y="Average Re")+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5, alpha=0.7)+
+  theme(#axis.text.x = element_text(angle = 0, hjust=1,vjust=1),
+        legend.position="none")
+p.re.averages
+
+#only plot averaages
+# focal.re.s.per %>%
+#   ggplot()+
+#   geom_point(aes(x=period, y=meanRe,group=Group, color=Group),shape=15,size=3,alpha=0.6,
+#                             position=position_dodge(width = 0.75))+
+#   geom_segment(aes(x=period, y=meanRe+sdRe, yend=meanRe-sdRe, group=Group, color=Group),
+#                             position=position_dodge(width = 0.75))+
+#   
+#   # geom_segment(aes(x=period,y=meanquant025, yend=meanquant975,group=Group, color=Group),
+#   #                             position=position_dodge(width = 0.75),lwd=0.7)+
+#   labs(x=NULL,y="Mean Re")+
+#   pubTheme+
+#   geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5, alpha=0.7)+
+#   scale_color_manual(values = riskcolz)
+```
+
+## Final composite plot with new piecewise changes 
+```{r}
+p.cases.allandrisk.2<-p.cases.allandrisk+
+  theme(legend.position = "top",
+        axis.title.y=element_text(size=rel(0.8)))
+p.chg.perc.2<-p.chg.perc+
+  labs(y="Annual % change new cases")+
+  theme(axis.title.y=element_text(size=rel(0.8)))
+p.re.averages.2<-p.re.averages+
+    theme(axis.title.y=element_text(size=rel(0.8)),
+          axis.text.x=element_text(size=rel(0.8)))
+
+#Alt layout 2
+col1z<-plot_grid(p.cases.allandrisk.2,p.chg.perc.2, p.re.averages.2, labels=LETTERS[1:3],ncol=1,align="v",
+                 rel_heights=c(0.9,1,0.8))
+allz<-plot_grid(col1z, p.re.allrisk, ncol=2, rel_widths=c(1,1), labels=c(NA, "D"))
+allz
+ggsave(paste0(f.out,"/comp_changeNewCases_Rt_AllandRisk_2012_smooth90_piecewise.png"),height=6.5,width=8.5)
+
+```
+## Overlay COVID-19 intervention stringency over Re in key pops and overall
+```{r}
+## read in oxford stringency and subset to BC
+#read in stringency for oxford
+ox<-read.csv("~/Desktop/sc2_can/20220322_phylogeo/04_canadaTimeline/oxford-tracker/OxCGRT_latest.csv") 
+ox.can<-ox[which(ox$CountryName=="Canada"),c("Date","CountryName","RegionName","StringencyIndex")]
+# table(ox.can$RegionName) #one per province and one unlabelled (all canada presume)
+ox.can$RegionName[ which(ox.can$RegionName=="")]<-"Canada"
+
+#convert dates
+ox.can$Date<-as.Date(as.character(ox.can$Date),format="%Y%m%d")
+# head(ox.can) 
+
+#BC only
+ox.bc<-ox.can %>%
+  filter(RegionName=="British Columbia")
+
+y.lim<-c(15,95)
+#PLOT ER UP
+ox.bc %>%
+  ggplot()+
+  geom_line(aes(x=Date,y=StringencyIndex))+
+  pubTheme+
+   theme(legend.position = "right",
+        legend.text=element_text(size=rel(0.6)),
+        legend.title=element_text(size=rel(0.7)))+
+  labs(x=NULL,y="Oxford Stringency Index, BC")+
+  scale_y_continuous(limits=y.lim, expand = c(0,0))
+
+#Transform it to the same scale
+max(ox.bc$StringencyIndex,na.rm = T)/2.5 #31.48 smaller
+min(ox.bc$StringencyIndex,na.rm = T)/0.5 #11 times smaller
+ox.bc<-ox.bc %>% mutate(StringencyIndex.t = (StringencyIndex / 32) )
+
+#from 15-95 to 0.5 to 2.5
+   
+## make a version with less x-axis
+## and different style annottations as above
+ymax4<-2.7
+p.re.allrisk.lessx2<-focal.re.s %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  # geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2018-01-01"),
+  #          y = ymax4,hjust=-0.01,vjust=0.8, label="PrEP", color="black",size=2)+
+  
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax4,hjust=-0.01,vjust=1.2, label="COVID-19", color="black",size=2)+
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.9, alpha=0.6)+
+
+  #DATA
+  geom_line(aes(x=date_start, y=meanR_smooth90,color=Group),)+
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth90, ymax=quant0.95_smooth90,fill=Group),alpha=0.2)+
+  pubTheme+
+  
+  #OXFORD COVID STRINGENCY
+  geom_line(data=ox.bc, aes(x=Date,y=StringencyIndex.t))+
+  
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5,alpha=0.7)+
+  labs(x=NULL, y="Effective reproduction number (Re)")+
+  #smaller x
+  scale_x_date(date_breaks="12 months",date_labels = "%Y",
+               limits = c(as.Date("2020-01-01"),as.Date("2022-09-01")), expand=c(0,0))+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.8)),
+        legend.position = "none", legend.text=element_text(size=rel(0.5)))+
+  scale_y_continuous(expand=c(0,0))+
+  coord_cartesian(ylim=c(ymin4,ymax4))+  
+  facet_wrap(~Group,scales="fixed",ncol=2)+
+  scale_color_manual(values=riskcolz)+
+  scale_fill_manual(values=riskcolz)
+p.re.allrisk.lessx2
+ggsave(paste0(f.out,"/Rt_focal-param_AllandRisk_95CI_2012-pres_90_lessx_COVIDSTRING.png"),height=3,width=6)
+
+```
+
