@@ -1,7 +1,7 @@
 # hiv_prep_bc
 
 ## Description
-Source code and summary tables for analyses within the pre-print [McLaughlin et al., 2024, medRxiv](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1) and peer-reviewed manuscript [in review PLoS Medicine](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1).
+Source code, figures, and tables for analyses presented in the pre-print, [McLaughlin et al., 2024, medRxiv](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1) and peer-reviewed manuscript [in review PLoS Medicine](https://www.medrxiv.org/content/10.1101/2024.09.06.24313187v1).
 
 ## Dependencies
 This pipeline was run on macOS Ventura 13.5.2
@@ -17,13 +17,11 @@ This pipeline was run on macOS Ventura 13.5.2
 * FastTree v2.2.1 
 * IQTREE-2.1.2
 
-### R packages - CHECK
-tidyverse 2.0.0, plyr 1.8.9, seqinr 4.2.36, geiger 2.0.11, ape 5.8, 
-Biostrings 3.1.3, phytools 0.7-70, phangorn 2.5.5,stringi 1.5.3, RColorBrewer 1.1-2, cowplot 1.1.164, ggtree 2.2.4, ggplotify 0.0.5.
-* EpiEstim ****
-* 
+### R packages
+tidyverse 2.0.0, plyr 1.8.9, seqinr 4.2.36, geiger 2.0.11, ape 5.8, Biostrings 3.1.3, phytools 0.7-70, phangorn 2.5.5, ggtree 2.2.4, cowplot 1.1.3, zoo 1.8-12, anytime 0.3.9, EpiEstim 2.2-4, incidence 1.7.4, boot 1.3-30, fitdistrplus 1.1-11, survival 3.6-4, MASS 7.3-60.2, vctrs 0.6.5, ConnMatTools 0.3.5 
+ 
 ## Usage
-The readme files in the subfolders have details on running scripts.
+See subfolder readme files.
 
 ## Thank you
 * Co-authors: Junine Toy, Vince Montoya, Paul Sereda, Jason Trigg, Mark Hull,  Chanson J. Brumme, Rolando Barrios,  Julio S.G. Montaner,  Jeffrey B. Joy
