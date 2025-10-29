@@ -1,0 +1,422 @@
+---
+title: "cluster compos"
+output: html_document
+date: "2023-11-07"
+---
+
+# changes 
+2024-05
+Add non-clustered as clusterID=9999
+
+# SETUP
+```{r}
+library(tidyverse)
+library(NatParksPalettes)
+library(gtools)
+```
+
+## ins n outs
+```{r}
+#clusters in
+clust.in<-"../../01_trees/pol_trees/pol_uniqID_trees_rootedOld/clusters/clusterSummary.csv" 
+
+#associated metadata
+dtp.in<-"../../00_data/01_clean/clean_output/phyloDTP.csv"
+subtype.in<-"../../00_data/02_align/03_subtypes/pol_uniqID_finalSubtypes.csv"
+drm.in<-"../../04_prep/ComparePrEPresistance/2023-10-30_DRM_tables/full.set.baseline.csv"
+
+#outs
+today<-Sys.Date()
+f.out<-paste0(today, "_Results/")
+if(!dir.exists(f.out)){dir.create(f.out)}
+
+pubTheme<-theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background=element_rect("grey95"), 
+                axis.line = element_line(colour = "black"),
+                text=element_text(size=10,face="bold"))
+
+```
+
+## clean up rega/comet subtypes and join to data
+```{r}
+subtypes<-read.csv(subtype.in)
+
+#PARSE the patid
+subtypes<-subtypes %>% separate(tip.label, sep="_",into=LETTERS[1:4],remove = F)
+subtypes$PATID<-subtypes$A
+subs<-subtypes[,c("PATID","finalsub","D")]
+
+#Need to reduce to a single subtype per patid (currently multiples)
+subs.pat<-data.frame(PATID=unique(subs$PATID))
+for (i in 1:nrow(subs.pat)){
+  pat<-subs.pat$PATID[i]
+  match<-which(subtypes$PATID==pat)
+  #take the sub that comes up the most (should all be the same but not nec with recombs)
+  sub<-names(sort(table(subtypes$finalsub[match]),decreasing = T)[1])
+  if(is.null(sub)){next} #not sure why?
+  subs.pat$subtype[i]<-sub
+}
+table(subs.pat$subtype)
+
+# ## Okay now join this on to dtp.sero, dtp.prep, dtp.nonprep
+# class(dtp.sero$PATID)<-"character"
+# dtp.sero<-dtp.sero %>% left_join(subs.pat, by="PATID")
+# class(dtp.prep$PATID)<-"character"
+# dtp.prep<-dtp.prep %>% left_join(subs.pat, by="PATID")
+# class(dtp.nonprep$PATID)<-"character"
+# dtp.nonprep<-dtp.nonprep %>% left_join(subs.pat, by="PATID")
+```
+
+
+## read in clusters
+```{r}
+clust.sum<-read.csv(clust.in)
+
+unq.clust<-clust.sum %>% distinct(clusterID,.keep_all = T) 
+unq.clust<-unq.clust[order(unq.clust$clusterSize,decreasing = T),] %>% as.data.frame()
+clust.order<-unq.clust$clusterID
+unq.clust$clusterID<-factor(unq.clust$clusterID, levels=clust.order)
+
+unq.clust
+nrow(unq.clust) #246 clusters
+
+# unq.clust
+# clust.sum
+```
+
+
+
+## connect cluster members to dtp data, subtypes
+```{r}
+#going to need diagnosis dates
+dtp<-read.csv(dtp.in)
+all(clust.sum$PATID %in% dtp$PATID)
+
+#subtypes
+which(!subs.pat$PATID %in% dtp$PATID) # one no matchy
+subs.pat[1269,] #this is the reference - remove
+subs.pat<-subs.pat[-1269,]
+all(subs.pat$PATID %in% dtp$PATID) #full matchy
+
+## MAKE A fake cluster for non-clsutred data to carry through
+dtp$newcase<-0
+# October 23, 2018 to December 5, 2022
+new<-which(dtp$FIRST_VL_DATE>=as.Date("2018-10-23") & 
+             dtp$FIRST_VL_DATE<=as.Date("2022-12-05") &
+             dtp$PREV_ARV==FALSE)
+dtp$newcase[new]<-1
+#filter 
+dtp.new<-dtp %>% filter(newcase==1)
+nonclust<-which(!dtp.new$PATID %in% clust.sum$PATID)
+
+#add these to clust.sum 
+clust.sum.non<-clust.sum[1:length(nonclust),]
+clust.sum.non$cluster_YN<-1
+clust.sum.non$clusterID<-9999
+clust.sum.non$clusterSize<-length(nonclust)
+#join em
+clust.sum<-bind_rows(clust.sum, clust.sum.non)
+
+#only keep pats in clusts (NOW also the nonclust)
+dtp.red<-dtp[which(dtp$PATID %in% clust.sum$PATID),]
+# nrow(dtp.red)
+
+#join cluster to patid in dtp
+dtp.all1<-left_join(dtp.red, clust.sum, by="PATID")
+class(subs.pat$PATID)
+class(dtp.all1$PATID)<-"character"
+dtp.all<-left_join(dtp.all1, subs.pat)
+
+#table of subtypes by PATID who are in clusters
+table(dtp.all$subtype)
+table(dtp.all$clusterID[dtp.all$subtype!="B"])
+noB.sub<-unique(dtp.all$subtype[dtp.all$subtype!="B"])
+noB.sub
+
+nonBclust<-unique(dtp.all$clusterID[dtp.all$subtype!="B"])
+```
+
+## create summary table of clusters
+```{r}
+dtp.all$FIRST_VL_DATE<-as.Date(dtp.all$FIRST_VL_DATE)
+dtp.all$BIRTHDATE<-as.Date(dtp.all$BIRTHDATE)
+dtp.all$age_2023<-interval(dtp.all$BIRTHDATE, as.Date("2023-02-09")) / years(1)
+  
+#gruop by cluster ID
+clust.comp<-dtp.all %>% 
+  dplyr::group_by(clusterID) %>% 
+  dplyr::summarize(size=clusterSize[1],
+                   #first, last, mean, and median date added (first VL)
+                   firstDate=first(sort(FIRST_VL_DATE)),
+                   lastDate=last(sort(FIRST_VL_DATE)),
+                   medianDate=median(FIRST_VL_DATE,na.rm=T),
+                   meanDate=mean(FIRST_VL_DATE,na.rm=T),
+                   
+                   #median and mean VL and CD4 baseline
+                   meanCDbase=mean(CD_BASE, na.rm=T),
+                   medianCDbase=median(CD_BASE, na.rm=T),
+                   meanVLbase=mean(VD_BASE, na.rm=T),
+                   medianVLbase=median(VD_BASE, na.rm=T),      
+                   
+                   #median and mean AGE at seroconv, and AGE at present
+                   meanAgeFARV=mean(AGE_FARV,na.rm=T),
+                   medianAgeFARV=median(AGE_FARV,na.rm=T),
+                   meanAge2023=mean(age_2023,na.rm=T),
+                   medianAge2023=median(age_2023,na.rm=T),
+                   
+                   #number and %: RSK-reported, MSM, HET, PWID, BLOOD
+                   n_RSK=sum(RSK_KNWN.x==1,na.rm=T),
+                   n_MSM=sum(RSK_MSM_R.x==1,na.rm=T),
+                   n_HET=sum(RSK_HETERO_R.x==1,na.rm=T),
+                   n_IDU=sum(RSK_IDU_RA.x==1,na.rm=T),
+                   n_BLOOD=sum(RSK_BLOOD_R.x==1,na.rm=T),
+                   n_HCV=sum(HEPC.x==1,na.rm=T),
+                   n_HCVrep=sum(HEPC.x %in% c(0,1), na.rm=T),
+                   
+                   perc_RSK= (n_RSK/size)*100,
+                   perc_MSM=(n_MSM/n_RSK)*100,
+                   perc_HET=(n_HET/n_RSK)*100,
+                   perc_IDU=(n_IDU/n_RSK)*100,
+                   perc_BLOOD=(n_BLOOD/n_RSK)*100,
+                   perc_HCV=(n_HCV/n_HCVrep)*100,
+                   
+                   #number of seroconverters since 2018
+                   n_seroconv_2018=sum(FIRST_VL_DATE > as.Date("2018-01-01"),na.rm = T),
+                   #since 2022
+                   n_seroconv_2022=sum(FIRST_VL_DATE > as.Date("2022-01-01"),na.rm = T),
+                  
+                   #number and %: PrEP use (% rel to n seroconv since 2018)
+                   n_PREP=sum(PREP==1,na.rm = T),
+                   perc_PREP=(n_PREP/n_seroconv_2018)*100,
+                   
+                   #number and %: each health authority
+                   n_HAknown=sum(HA_NAME!="",na.rm=T),
+                   n_HA_Van=sum(HA_NAME=="VANCOUVER COASTAL",na.rm=T),
+                   n_HA_VanIsl=sum(HA_NAME=="VANCOUVER ISLAND",na.rm=T),
+                   n_HA_Fras=sum(HA_NAME=="FRASER",na.rm=T),
+                   n_HA_North=sum(HA_NAME=="NORTHERN",na.rm=T),
+                   n_HA_Int=sum(HA_NAME=="INTERIOR",na.rm=T),
+
+                   perc_HAknown=(n_HAknown/size)*100,
+                   perc_HA_Van=(n_HA_Van/n_HAknown)*100,
+                   perc_HA_VanIsl=(n_HA_VanIsl/n_HAknown)*100,
+                   perc_HA_Fras=(n_HA_Fras/n_HAknown)*100,
+                   perc_HA_North=(n_HA_North/n_HAknown)*100,
+                   perc_HA_Int=(n_HA_Int/n_HAknown)*100,
+                  
+                   #subtype N and percent (should all agree...in theory not always bc recomb)
+                   #changed to subtype in 2024
+                   n_subB=sum(subtype=="B",na.rm=T),
+                   n_subC=sum(subtype=="C",na.rm=T),
+                   n_subAE=sum(subtype=="01_AE",na.rm=T),
+                   n_subF=sum(subtype=="F1",na.rm=T),
+                   n_subBlike=sum(subtype=="B-like",na.rm=T),
+                   n_subBrecomb=sum(subtype=="B, potential recombinant",na.rm=T),
+                   n_subBDrecomb=sum(subtype=="Recombinant of B, D" ,na.rm=T),
+                   )
+
+#Order the new df by cluster size, then by most recent member added
+clust.comp<-clust.comp[order(clust.comp$size,decreasing = T),] %>% as.data.frame()
+clust.order<-clust.comp$clusterID
+clust.comp$clusterID<-factor(clust.comp$clusterID, levels=clust.order)
+
+
+#active: have seroconv_2018 > 0?
+clust.comp$active<-clust.comp$n_seroconv_2018>0
+clust.comp$active22<-clust.comp$n_seroconv_2022>0
+
+#moderate size >10
+clust.comp$medium<-clust.comp$size>=10
+
+#big size >20
+clust.comp$big<-clust.comp$size>=20
+
+#large size
+clust.comp$large<-clust.comp$size>=100
+
+#check out
+table(clust.comp$active, clust.comp$big) #84 active total, 28 of which are big
+table(clust.comp$active22) #25 active clusters as of Jan 2022
+table(clust.comp$active22, clust.comp$big) #17/25 are small
+table(clust.comp$n_seroconv_2022 [clust.comp$active22==T])
+
+## export this table
+write.csv(clust.comp, paste0(f.out,"ClusterComposition.csv"))
+```
+
+## filter to a list of big active clusters 
+```{r}
+clust.bigact<-clust.comp %>% filter(active==T & big==T)
+nrow(clust.bigact)
+write.csv(clust.bigact, paste0(f.out,"BigActive_ClusterComposition.csv"))
+
+clust.medact<-clust.comp %>% filter(active==T & medium==T)
+write.csv(clust.medact, paste0(f.out,"MedActive_ClusterComposition.csv"))
+clust.lrgact<-clust.comp %>% filter(active==T & large==T)
+nrow(clust.lrgact)
+
+clust.act<-clust.comp %>% filter(active==T)
+nrow(clust.act)
+write.csv(clust.act, paste0(f.out,"Active_ClusterComposition.csv"))
+
+clust.act22<-clust.comp %>% filter(active22==T)
+nrow(clust.act22)
+write.csv(clust.act22, paste0(f.out,"Active2022_ClusterComposition.csv"))
+
+nrow(clust.act22 %>% filter(medium==T))
+nrow(clust.act22 %>% filter(big==T))
+nrow(clust.act22 %>% filter(large==T))
+```
+
+## read in the drug resistance data and summarize drug res by cluster for big active
+```{r}
+drm<-read.csv(drm.in)
+head(drm)
+# drm2<-read.csv("../../04_prep/ComparePrEPresistance/2023-10-30_DRM_tables/sdrm.df.baseline.long.csv")
+# head(drm2)
+
+drm.c<-left_join(drm,clust.sum,by="PATID")
+table(drm.c$cluster_YN)
+# which(drm.c$clusterID==9999)
+
+#remove non clustering 
+naz<-which(is.na(drm.c$cluster_YN))
+if(length(naz)>0){
+  drm.c<-drm.c[-naz,]
+}
+
+#also make more manageable by only looking at TSMs
+table(drm.c$Type)
+drm.c<-drm.c %>% filter(Type %in% c("NRTI.TSMs","NNRTI.TSMs","INSTI.TSMs","PI.TSMs"))
+# which(drm.c$clusterID==9999)
+
+#unique muts
+table(drm.c$Mutation)
+
+## FIRST, group by patient, see if any each type of TSM
+pat.drms<-drm.c %>% group_by(PATID) %>%
+  dplyr::summarise(clusterID=clusterID[1],
+                   clusterSize=clusterSize[1],
+                   totalNRTI=sum(Type=="NRTI.TSMs",na.rm=T),
+                   totalNNRTI=sum(Type=="NNRTI.TSMs",na.rm=T),
+                   totalINSTI=sum(Type=="INSTI.TSMs",na.rm=T),
+                   totalPI=sum(Type=="PI.TSMs",na.rm=T))
+#Join on the n_new cases since 2018 to use as denominator
+clust.comp.red<-clust.comp[,c("clusterID","n_seroconv_2018")]
+pat.drms$clusterID<-as.character(pat.drms$clusterID)
+clust.comp.red$clusterID<-as.character(clust.comp.red$clusterID)
+pat.drms2<-left_join(pat.drms,clust.comp.red,by="clusterID")
+
+#Total for each cluster how many pats have any type of TSM
+clust.pat.drms<-pat.drms2 %>% group_by(clusterID) %>%
+  dplyr::summarise(clusterSize=clusterSize[1],
+                   n_seroconv_2018=n_seroconv_2018[1],
+                   n_anyNRTI=sum(totalNRTI>0,na.rm=T),
+                    n_anyNNRTI=sum(totalNNRTI>0,na.rm=T),
+                    n_anyINSTI=sum(totalINSTI>0,na.rm=T),
+                    n_anyPI=sum(totalPI>0,na.rm=T),
+                    perc_anyNRTI=(n_anyNRTI/n_seroconv_2018)*100,
+                    perc_anyNNRTI=(n_anyNNRTI/n_seroconv_2018)*100,
+                    perc_anyINSTI=(n_anyINSTI/n_seroconv_2018)*100,
+                    perc_anyPI=(n_anyPI/n_seroconv_2018)*100,
+                   )
+
+#order by size as above then export
+clust.pat.drms<-clust.pat.drms[order(clust.pat.drms$clusterSize,decreasing = T),] %>% as.data.frame()
+clust.pat.drms
+
+#group by cluster to count occureneces of each mutations
+table(drm.c$Mutation)
+muts<-names(table(drm.c$Mutation))
+
+#and count n pats with any NRTI res, NNRTI res (Type==NRTI.SDRM for ex)
+clust.drms<-drm.c %>% group_by(clusterID) %>%
+  dplyr::summarise(total_A71I=sum(Mutation=="A71I"), 
+                   total_D67N=sum(Mutation=="D67N"), 
+                   total_E138A=sum(Mutation=="E138A"), 
+                   total_E138K=sum(Mutation=="E138K"), 
+                   total_E203K=sum(Mutation=="E203K"), 
+                   total_G190A=sum(Mutation=="G190A"), 
+                   total_H208Y=sum(Mutation=="H208Y"), 
+                   total_I66F=sum(Mutation=="I66F"), 
+                   total_K103N=sum(Mutation=="K103N"),
+                   total_K103S=sum(Mutation=="K103S"), 
+                   total_K45I=sum(Mutation=="K45I"), 
+                   total_K70E=sum(Mutation=="K70E"), 
+                   total_K70R=sum(Mutation=="K70R"), 
+                   total_L210W=sum(Mutation=="L210W"), 
+                   total_M184IV=sum(Mutation=="M184IV"), 
+                   total_M184V=sum(Mutation=="M184V"), 
+                   total_M41L=sum(Mutation=="M41L"), 
+                   total_M46I=sum(Mutation=="M46I"), 
+                   total_M46V=sum(Mutation=="M46V"), 
+                   total_N348I=sum(Mutation=="N348I"), 
+                   total_T215D=sum(Mutation=="T215D"), 
+                   total_T215E=sum(Mutation=="T215E"), 
+                   total_T215I=sum(Mutation=="T215I"), 
+                   total_T215S=sum(Mutation=="T215S"), 
+                   total_T66I=sum(Mutation=="T66I"),
+                   total_V108I=sum(Mutation=="V108I"),
+                   total_V75I=sum(Mutation=="V75I"),
+                   total_Y143S=sum(Mutation=="Y143S"),
+                   total_Y181C=sum(Mutation=="Y181C"),
+                   )
+# clust.drms
+
+#join this with the previous df
+clust.drms$clusterID<-as.character(clust.drms$clusterID)
+all.clust.drms<-left_join(clust.pat.drms, clust.drms, by="clusterID")
+write.csv(all.clust.drms, paste0(f.out,"all.clust.drms.csv"))
+```
+
+## Make a summary of percent of PATIDs with different drug resistance in active clsutres with DRMs
+```{r}
+#First, how many with any of each drug class resistnace?
+nrow(all.clust.drms %>% filter(n_anyNRTI>0))
+nrow(all.clust.drms %>% filter(n_anyNNRTI>0))
+nrow(all.clust.drms %>% filter(n_anyPI>0))
+nrow(all.clust.drms %>% filter(n_anyINSTI>0))
+
+##MAke a long version of the proportions and Ns of drug class
+all.clust.drms.l<-all.clust.drms %>% 
+  pivot_longer(cols = 4:11) %>%
+  separate(name, into=c("type","drug"))
+all.clust.drms.l$drug<-str_replace_all(all.clust.drms.l$drug, "any","")
+all.clust.drms.l$drug<-factor(all.clust.drms.l$drug, levels=c("NRTI","NNRTI","PI","INSTI"))
+#remove zeroes
+zer<-which(all.clust.drms.l$value==0)
+all.clust.drms.l<-all.clust.drms.l[-zer,]
+all.clust.drms.l$clusterID<-factor(all.clust.drms.l$clusterID, levels=sort(as.numeric(unique(all.clust.drms.l$clusterID))))
+
+library(ggh4x)
+ggplot(all.clust.drms.l)+
+  geom_col(aes(x=clusterID, y=value),fill="cyan3",
+           position=position_dodge2(preserve="single",width=0.9))+
+  ggh4x::facet_grid2(type~drug, scales="free",independent = "x",switch = "y")+
+  pubTheme+
+  theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1))+
+  labs(y="New members with drug resistance", x="Cluster")
+ggsave(paste0(f.out, "NewClusterMems_PropN_DRMS.png"),width=7,height=4)
+
+# For clusters with >50% any mutation in new cases, report what mutations, what n
+high<-all.clust.drms.l %>% 
+  filter(type=="n") %>%
+  filter(value>2) %>%
+  select(clusterID) %>% as.vector() %>%unlist() %>% as.character()
+# high<-all.clust.drms.l$clusterID[which(all.clust.drms.l$value>30)]
+(high)
+high.all<-all.clust.drms %>%
+  filter(clusterID %in% high) 
+high.all
+```
+
+
+## Make a big table that has allll this information together
+```{r}
+all.clust.drms$clusterID<-factor(all.clust.drms$clusterID)
+wide.clust<-left_join(clust.comp,all.clust.drms,by="clusterID")
+write.csv(wide.clust, paste0(f.out,"wide.clust.csv"))
+```
+
+
