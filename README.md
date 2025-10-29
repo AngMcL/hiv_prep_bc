@@ -17,8 +17,8 @@ This pipeline was run on macOS Ventura 13.5.2
 * FastTree v2.2.1 
 * IQTREE-2.1.2
 
-### R packages
-tidyverse 2.0.0, plyr 1.8.9, seqinr 4.2.36, geiger 2.0.11, ape 5.8, Biostrings 3.1.3, phytools 0.7-70, phangorn 2.5.5, ggtree 2.2.4, cowplot 1.1.3, zoo 1.8-12, anytime 0.3.9, EpiEstim 2.2-4, incidence 1.7.4, boot 1.3-30, fitdistrplus 1.1-11, survival 3.6-4, MASS 7.3-60.2, vctrs 0.6.5, ConnMatTools 0.3.5 
+### R packages/versions
+tidyverse 2.0.0, plyr 1.8.9, seqinr 4.2.36, geiger 2.0.11, ape 5.8, Biostrings 3.1.3, phytools 2.1-1, phangorn 2.5.5, ggtree 3.12.0, cowplot 1.1.3, zoo 1.8-12, anytime 0.3.9, EpiEstim 2.2-4, incidence 1.7.4, boot 1.3-30, fitdistrplus 1.1-11, survival 3.6-4, MASS 7.3-60.2, vctrs 0.6.5, ConnMatTools 0.3.5, aplot 0.2.2, statmod 1.5.0, epitools 0.5-10.1, ggsignif 0.6.4, RColorBrewer 1.1-3, gtools 3.9.5
  
 ## Usage
 See subfolder readme files.
