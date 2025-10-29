@@ -1,0 +1,2032 @@
+---
+title: "cluster Rt"
+author: "Angela"
+date: "20/10/2021"
+output: html_document
+---
+
+# Objectives
+* use the cluster summary to build cluster line lists of patids over time
+* export fasta and representative subtrees of each cluster
+* use cluster line lists to estimate the effective reproduction number over time using EpiEstim, assume a distrib for the serial interval
+
+# change log
+2024-08-22
+Add a plot of key clusters growth since 2018 stepwise overlays all starting at zero, or all starting at size end 2017
+Add this to Fig S1
+
+2024-05
+* add the clsuter compare script in here
+* key clusters
+* focus smooth 90 as middlegound param
+* calculate epochal Rt and covid, post covid effects on all Re
+* stochastic cases averted
+
+2024-02-27
+* export nicely formatted plots with limited y-axes, x-axes
+* summarize % of clusters with reduced or not Re and growth rates among predominantly GBM, HET, PWID
+* other summary metrics to extract from clustres?
+* expand counterfactual analysis, previously just determinsitic - how can we make it stochastic?
+
+# SETUP
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(EpiEstim)
+library(ape)
+library(RColorBrewer)
+library(plyr)
+library(zoo)
+library(NatParksPalettes)
+library(cowplot)
+
+## INs
+
+#CLUSTERS (tree rooted on oldest B seq root, 90% threshold)
+clust.in<-"../../01_trees/pol_trees/pol_uniqID_trees_rootedOld/clusters/clusterSummary.csv" 
+
+#Alignments for cluster specific aligns
+tree.in<-"../../01_trees/pol_trees/pol_uniqID_trees_rootedOld/pol_uniqID_rootOld_1.nwk"
+pol.in<-"../../00_data/02_align/02_aligned-minimap/aligns_for_trees/pol_uniqID_refs_align_mask.fasta" 
+
+#alignment to take cluster specific fasta from
+pol.unmask.in<-"../../00_data/02_align/02_aligned-minimap/pol_uniqID_refs_align.fasta" #alignment to take cluster 
+
+#DTP data 
+dtp.in<-"../../00_data/01_clean/clean_output/phyloDTP.csv"
+
+#cluster composition
+clust.comp.in<-"../cluster_composition/2024-05-30_Results/ClusterComposition.csv"
+
+## OUTs
+
+today<-Sys.Date()
+f.out<-paste0(today,"_Results")
+if(!dir.exists(f.out)){dir.create(f.out)}
+
+#linelist of patids by cluster
+linelist.out<-paste0(f.out,"/cluster.linelist.csv")
+
+#fasta out
+fast.out<-paste0("../cluster-fasta")
+if(!dir.exists(fast.out)){dir.create(fast.out)}
+
+pubTheme<-theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background=element_rect("grey95"), 
+                axis.line = element_line(colour = "black"),
+                text=element_text(size=10,face="bold"))
+
+#colors
+riskcolz<-c("darkred","darkblue","darkorange3","darkgreen")
+names(riskcolz)<-c("All","GBM","PWID","HET")
+
+```
+
+# Connect clustres and DTP data
+
+## read in clusters and dtp data
+```{r}
+## cluster summary in (one row per pat)
+clust.sum<-read.csv(clust.in)
+
+#going to need diagnosis dates
+dtp<-read.csv(dtp.in)
+
+dtp$FIRST_VL_DATE<-as.Date(dtp$FIRST_VL_DATE)
+
+#matchy matchy
+all(clust.sum$PATID %in% dtp$PATID)
+nrow(clust.sum)/nrow(dtp)
+nrow(dtp[which(dtp$PREV_ARV==F),])
+
+#overall percent clustering of those with no prev ARV (migrants)
+nrow(clust.sum)/nrow(dtp[which(dtp$PREV_ARV==F),])*100
+
+#### Add the non-clustered as a fake cluster 9999 
+# dtp$newcase<-0
+# # October 23, 2018 to December 5, 2022
+# new<-which(dtp$FIRST_VL_DATE>=as.Date("2018-10-23") & 
+#              dtp$FIRST_VL_DATE<=as.Date("2022-12-05") &
+#              dtp$PREV_ARV==FALSE)
+# dtp$newcase[new]<-1
+# #filter 
+# dtp.new<-dtp %>% filter(newcase==1)
+
+#actually want all the non-clustred through time not just newly diag
+nonclust<-which(!dtp$PATID %in% clust.sum$PATID)
+length(nonclust)
+#add these to clust.sum 
+clust.sum.non<-clust.sum[1:length(nonclust),]
+clust.sum.non$cluster_YN<-1
+clust.sum.non$clusterID<-9999
+clust.sum.non$clusterSize<-length(nonclust)
+
+#join em
+clust.sum<-bind_rows(clust.sum, clust.sum.non)
+
+#unique cluster IDs and their size
+unq.clust<-clust.sum %>% dplyr::group_by(clusterID) %>% dplyr::summarize(size=clusterSize[1])
+unq.clust<-unq.clust[order(unq.clust$size,decreasing = T),] %>% as.data.frame()
+clust.order<-unq.clust$clusterID
+unq.clust$clusterID<-factor(unq.clust$clusterID, levels=clust.order)
+
+#how many clusters >10? ("big" or medium ones)
+n<-10
+length(which(unq.clust$size>=n))
+
+unq.clust %>%
+  filter(clusterID != 9999) %>%
+  ggplot()+
+  geom_bar(aes(x=size), color="tomato4")+
+  labs(x="Cluster size", y="Number of clusters")+
+  pubTheme+
+  annotate(geom="label",x=250,y=30,label="N clusters: 246\nSize range: 5-471\nMean: 19.3\nMedian: 8",hjust=0)+
+  geom_vline(xintercept = 10, color="deepskyblue4",linetype=2)+
+  geom_vline(xintercept = 20, color="deepskyblue4",linetype=2)+
+  geom_vline(xintercept = 50, color="deepskyblue4",linetype=2)+
+  geom_vline(xintercept = 100, color="deepskyblue4",linetype=2)+
+  annotate(geom="text",x=11,y=50,label="Size >= 10: 102 clusters",hjust=0,size=2,color="deepskyblue4")+
+  annotate(geom="text",x=21,y=45,label="Size >= 20: 41 clusters",hjust=0,size=2,color="deepskyblue4")+
+  annotate(geom="text",x=51,y=40,label="Size >= 50: 13 clusters",hjust=0,size=2,color="deepskyblue4")+
+  annotate(geom="text",x=101,y=35,label="Size >= 100: 5 clusters",hjust=0,size=2,color="deepskyblue4")
+
+ggsave(paste0(f.out,"/cluster-size-distrib.png"),width = 4,height=3)    
+
+#big ones are bigger than 10 includes 9999 (non clust)
+big.ones<-unq.clust$clusterID[which(unq.clust$size>=n)]
+
+#reduce to cluster members (although now includes non clustered as cluster)
+dtp.red<-dtp[which(dtp$PATID %in% clust.sum$PATID), c("PATID","FIRST_VL_DATE","FARVDT","HA_NAME","PREP","GRPRSK","HEPC.x","HEPB","END_FOLLOW_STATUS.x","END_FOLLOW_DT.x")]
+# length(which(is.na(dtp.red$FARVDT)))
+# length(which(is.na(dtp.red$FIRST_VL_DATE))) #fewer NA
+
+#make missing HAs NAs
+empty<-which(dtp.red$HA_NAME=="")
+dtp.red$HA_NAME[empty]<-NA
+
+#find NAs and replace with alternative COLDATE
+missing<-which(is.na(dtp.red$FIRST_VL_DATE))
+dtp.red$FIRST_VL_DATE[missing]<-dtp[match(dtp.red[missing,'PATID'],dtp$PATID),'COLDATE']
+
+#make a dtp.red with cluster ID on it 
+dtp.red2<-dtp.red %>% left_join(clust.sum,by="PATID")
+
+#order this by cluster ID then by first vl date
+dtp.red3<-with(dtp.red2, dtp.red2[order(clusterID, FIRST_VL_DATE),])
+dtp.red4<-dtp.red3 %>% arrange(factor(clusterID, levels = clust.order))
+
+#remove me
+#dtp by pat reduced to those in clusterse
+dtp.red4<-dtp.red4 %>% select(-cluster_YN)
+
+# export linelist with all clusters in one df
+write.csv(dtp.red4, linelist.out)
+
+#add yaermonth
+dtp.red5<-dtp.red4%>% mutate (yearmonth=zoo::as.yearmon(FIRST_VL_DATE))
+
+#how many new cluster members since 2018?
+length(which(dtp.red5$yearmonth>zoo::as.yearmon(as.Date("2018-01-01")))) #424
+length(which(dtp.red5$yearmonth>zoo::as.yearmon(as.Date("2020-01-01")))) #237
+length(which(dtp.red5$yearmonth>zoo::as.yearmon(as.Date("2021-01-01")))) #152
+
+#check
+dtp.red5 %>%
+  ggplot()+
+  geom_histogram(aes(x=as.Date(FIRST_VL_DATE), group=as.factor(clusterID), fill=as.factor(clusterID)))+
+  theme(legend.position = "none")+
+  scale_fill_viridis_d(option = "m")
+ggsave(paste0(f.out,"newCasesByClustreStack.png"))
+```
+
+## Cluster growth since 2018
+```{r}
+dtp.red5.2<-dtp.red5 %>%   
+  filter(FIRST_VL_DATE > as.Date("2018-01-01")) 
+which(is.na(dtp.red5.2$PREP))
+dtp.red5.2$clusterID[which(is.na(dtp.red5.2$PREP))]
+dtp.red5.2$PREP<-factor(dtp.red5.2$PREP, levels=c(0,1))
+dtp.red5.2 %>%
+  filter(!is.na(PREP)) %>% #some people excl if after diagnoses date cutoff
+  ggplot()+
+  geom_bar(aes(x=yearmonth, group=clusterID, fill=as.factor(clusterID), 
+               color=as.factor(clusterID)))+
+  theme(legend.position = "none")
+
+
+plot.clustcases.month<-dtp.red5.2 %>%
+  filter(!is.na(PREP)) %>% #some people excl if after diagnoses date cutoff
+  ggplot()+
+  pubTheme+
+  geom_bar(aes(x=yearmonth+1/24, group=PREP, fill=PREP))+
+  theme(legend.position = "none",
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  scale_fill_manual(values=c("orange3","maroon"))+
+  labs(x=NULL,y="Monthly new diagnoses clustered")+
+  coord_cartesian(xlim=as.yearmon(c("2018-01-01","2023-01-01")))+
+  scale_x_yearmon(expand=c(0.01,0), format = "%b %Y")
+    
+plot.clustcases.month
+ggsave(paste0(f.out, "/NewCasesClustereedByPrEP_overMonth.png"), width=8.5,height=2.5)
+
+```
+
+
+## Colors by population
+```{r}
+## quick color scale for HAs
+HAcolz<-brewer.pal(n=6,name = "Dark2")
+HAnmz<-c(names(rev(sort(table(dtp.red2$HA_NAME)))),NA)
+names(HAcolz)<-HAnmz
+
+rskz<-names(sort(table(dtp.red$GRPRSK)))
+RSKcolz<-colorRampPalette(colors=natparks.pals("Arches"))(length(rskz))
+names(RSKcolz)<-rskz
+
+#PREP colz
+prep.cols<-c("maroon","orange3")
+names(prep.cols)<-c("PrEP","No PrEP")
+fillPrep<-scale_fill_manual(values=prep.cols)
+colorPrep<-scale_color_manual(values=prep.cols)
+prep.cols2<-prep.cols
+names(prep.cols2)<-c("1","0")
+```
+
+## table of n new cases (no prev ART) by year, n in cluster of new cases (%), and n PREP 
+```{r}
+dtp.p<-dtp
+
+#make sure that those with PREP==1 actually filled prescrip
+chng<-which(is.na(dtp.p$PREP_DISP_DT) & dtp.p$PREP==1) 
+dtp.p$PREP[chng]<-0
+
+#join on the cluster info
+dtp.p<-dtp.p %>% left_join(clust.sum, by="PATID")
+
+#extract year
+dtp.p$year<-sapply(dtp.p$FIRST_VL_DATE, function(x) unlist(str_split(as.character(x), "-"))[1])
+
+# table(dtp.p$year)
+#Count em
+dtp.p.yr<- dtp.p %>% 
+  filter(PREV_ARV!=1) %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarise(.groups="rowwise",
+                   total.newcases=n(),
+                   total.newcases.clust=length(which(cluster_YN==1)),
+                   total.newcases.PREP=length(which(PREP==1)),
+                   total.newcases.clustPREP=length(which(cluster_YN==1 & PREP==1)),
+                   total.newcases.NOPREP=length(which(PREP!=1)),
+                   total.newcases.clustNOPREP=length(which(cluster_YN==1 & PREP!=1)),
+                   ## how many unique clusters joined?
+                   total.clusters=length(unique(clusterID)),
+                   total.clustersPREP=length(unique(clusterID[PREP==1])),
+                   total.clustersNOPREP=length(unique(clusterID[PREP!=1])),
+                   )
+
+
+
+dtp.p.yr<-dtp.p.yr %>% mutate(perc.newcases.clust=round(total.newcases.clust/total.newcases*100,digits = 1),
+                              perc.newcases.clustPREP=round(total.newcases.clustPREP/total.newcases.PREP*100,digits=1),
+                              perc.newcases.clustNOPREP=round(total.newcases.clustNOPREP/total.newcases.NOPREP*100,digits=1) )
+
+write.csv(dtp.p.yr, paste0(f.out, "/dtp_newcases_clust_prep.csv"))
+
+#how many unique clusters for prep, no prep for all of 2018-2022:
+dtp.p %>% filter(year>=2018) %>% dplyr::group_by(PREP) %>% dplyr::summarize(.groups="rowwise",
+                                       unq.clust=length(unique(clusterID)))
+```
+
+# Cluster composition data
+```{r}
+clust.comp<-read.csv(clust.comp.in)
+
+#filter for big and active (since 2018 or 2022)
+# clust.bigact<-clust.comp %>% filter(active==T & big==T)
+nrow(clust.comp) 
+which(clust.comp$clusterID==9999)
+
+#look for active since 2016 (>1 case since 2016)
+
+#then find which are GBM predominant, PWID predominant, HET predominant, or mixed
+# >=50%
+colnames(clust.comp)
+length(which(clust.comp$active==1)) #84 with >1 case since 2018
+
+# active.clust<-clust.comp %>% filter(clust.comp$active==1)
+
+# find primary risk
+clust.comp$risk<-NA
+for (i in 1:nrow(clust.comp)){
+  #If NA, just say mixed
+  if(is.na(clust.comp$perc_MSM[i])){
+    clust.comp$risk[i]<-"mixed";next}
+
+  if(clust.comp$perc_MSM[i]>=50){
+    clust.comp$risk[i]<-"GBM"; next
+  }
+  if(clust.comp$perc_IDU[i]>=50){
+    clust.comp$risk[i]<-"PWID"; next
+  }
+  if(clust.comp$perc_HET[i]>=50){
+    clust.comp$risk[i]<-"HET"; next
+  }
+  #if none of these, then mixed
+  clust.comp$risk[i]<-"mixed"
+}
+
+```
+
+## for big/medium active clusters, plot cases over time by HA facetted
+```{r}
+med.active.clust<-clust.comp$clusterID[which(clust.comp$active==TRUE & clust.comp$medium==TRUE)]# >=size 10
+
+#clust comp extraactive >=3 new cases
+clust.comp$active3<-FALSE
+clust.comp$active3[which(clust.comp$n_seroconv_2018>=3)]<-TRUE
+med.active.clust<-clust.comp$clusterID[which(clust.comp$active3==TRUE & clust.comp$medium==TRUE)]# >=size 10
+length(med.active.clust)
+
+#these have no data after excl wide Re#these have no data TRUEafter excl wide Re
+# med.active.clust.ls<-med.active.clust[-which(med.active.clust %in% c(14, 29, 221, 206, 132,
+#                                                                   109, 168, 203, 193, 201, 208))]
+
+dtp.red4$quarter<-quarter(dtp.red4$FIRST_VL_DATE, type = "date_first")
+dtp.red4.2<-dtp.red4 %>% 
+  filter(clusterID %in% med.active.clust) %>%
+  dplyr::group_by(clusterID, quarter, HA_NAME) %>% 
+  tally() %>% as.data.frame()
+
+ggplot(dtp.red4.2,aes(x=as.Date(quarter))) +
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  
+  geom_bar(aes(y=n,fill=HA_NAME),stat="identity")+
+  scale_x_date(date_breaks = "12 months",
+             date_labels = "%Y", 
+             limits=c(as.Date("2015-01-01"),as.Date("2023-02-02")),expand=c(0,0))+
+  scale_y_continuous( expand=c(0.02,0))+
+  scale_fill_manual(values=HAcolz)+
+  labs(x=NULL, y="New cases by quarter")+
+  pubTheme+
+  theme(title=element_text(size=7),legend.position="top", #"bottom",
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.9)))+
+  facet_wrap(.~clusterID,drop = TRUE, scales="free_y",nrow=6)+
+  guides(fill=guide_legend(title="Health authority",nrow=1))
+
+ggsave(paste(f.out,"/CasesOverTime_Facet-clust.png",sep=""),
+     height=8,width=8.5)
+
+```
+
+## Repeat this plot only since 2018, color is prep
+```{r}
+dtp.red4.3<-dtp.red4 %>% 
+  filter(clusterID %in% med.active.clust) %>%
+  dplyr::group_by(clusterID, quarter, PREP) %>% 
+  tally() %>% as.data.frame()
+
+dtp.red4.3$PREP<-factor(dtp.red4.3$PREP, levels=c("1","0"))
+dtp.red4.3 %>%
+  filter(!is.na(PREP)) %>%
+  ggplot(aes(x=as.Date(quarter))) +
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+
+  geom_bar(aes(y=n,fill=PREP),stat="identity")+
+  scale_x_date(date_breaks = "12 months",
+             date_labels = "%Y", 
+             limits=c(as.Date("2018-01-01"),as.Date("2022-12-22")),expand=c(0,0))+
+  scale_y_continuous( expand=c(0.02,0))+
+  scale_fill_manual(values=prep.cols2, labels=c("PrEP","No PrEP"))+
+  labs(x=NULL, y="New cases by quarter")+
+  pubTheme+
+  theme(title=element_text(size=7),legend.position="top", #"bottom",
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.9)))+
+  facet_wrap(.~clusterID,drop = TRUE, scales="free_y",nrow=6)+
+  guides(fill=guide_legend(title="Newly diagnosed",nrow=1))
+
+ggsave(paste(f.out,"/CasesOverTime_PREP_Facet-clust_2018.png",sep=""),
+     height=6,width=8.5)
+```
+
+
+## set up a list of df where each df is a cluster with 1 row per patient, with their first vl date
+```{r}
+n.clust<-length(clust.order) #246
+clust.list<-replicate(n.clust, vector())
+names(clust.list)<-clust.order
+
+for (i in 1:n.clust){
+  #find patients with this cluster
+  patz<-which(dtp.red4$clusterID == clust.order[i]) 
+  #extract
+  clust.list[[i]]<-dtp.red4[patz,]
+}
+
+
+```
+
+# Cluster plots of new cases over time 
+
+## Plots stepwise additions of cluster members overall- can skip
+```{r}
+f.step.all.out<-paste(f.out,"/stepwise_clust",sep="")
+if(!dir.exists(f.step.all.out)){dir.create(f.step.all.out)}
+
+# function that generates stepwise plot of counts by sample collection dates by location
+plot.stepwise.all.dates<-function(df){
+  if(nrow(df)>=n){ #only for sublineages >=20 
+    name<-df$clusterID[1]
+    df$FIRST_VL_DATE<-as.Date(df$FIRST_VL_DATE)
+    N<-paste0(": ",nrow(df)," cluster members")
+    df2 <- ddply(df,.(),transform,len=length(FIRST_VL_DATE))
+    maxlen<-max(df2$len)
+    ggplot(df2,aes(x=FIRST_VL_DATE)) + 
+      geom_step(aes(len=len,y=..y.. * len),stat="ecdf",size=1,color="darkblue")+ 
+      scale_x_date(date_breaks = "12 months", #date_minor_breaks = "2 weeks", 
+                 date_labels = "%Y")+
+      labs(x=NULL, y="Cluster members", color="HA", 
+           title=paste0("Cluster ",name,N))+
+      pubTheme+
+      theme(title=element_text(size=7),legend.position="none", #"bottom" ,
+            axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+      # guides(col=guide_legend(nrow=2,title.position = "top"))
+    ggsave(paste(f.step.all.out,"/clust",name,"_Stepwise",".png",sep=""),
+           width=4,height=3)
+  }
+}
+
+lapply(clust.list, plot.stepwise.all.dates)
+
+```
+
+## For large active clusters, overlay the stepwise addition of new members over time since 2018
+```{r}
+
+transform.len<-function(df){
+  # if(nrow(df)>=n){
+    df1<-df %>% filter(FIRST_VL_DATE>=as.Date("2018-01-01"))
+    df2 <- ddply(df1,.(),transform,len=length(FIRST_VL_DATE))
+    return(df2)
+  # }
+}
+clust.list.t<-lapply(clust.list,transform.len)
+
+clust.df<-bind_rows(clust.list.t) 
+
+#subset
+less.clust.df <- clust.df %>%
+  filter(clusterID %in% med.active.clust) %>%
+  filter(clusterID != "9999") %>%
+  filter(FIRST_VL_DATE >= as.Date("2018-01-01")) %>%
+  filter(!is.na(PREP))
+
+clust.lab<-less.clust.df %>% 
+  group_by(clusterID) %>%
+  dplyr::summarize(maxlen=max(len,na.rm = T))%>%  
+  filter(maxlen>10)
+
+library(ggrepel)
+plot.step.clust<-ggplot(less.clust.df,aes(x=FIRST_VL_DATE)) + 
+  geom_step(aes(len=len,y=..y.. * len, group=clusterID,color=clusterID),stat="ecdf",size=1)+ 
+
+  geom_label_repel(data=clust.lab, aes(label=clusterID, x=as.Date("2023-01-01"), y=maxlen, color=clusterID),
+                   vjust=0, hjust=0.3,
+                  size=3,force = 1,box.padding = 0.07,
+                  min.segment.length = 0.2, 
+                  point.padding = 0.25, alpha=0.6,
+                  )+
+  labs(x=NULL, y="New diagnoses in clusters")+
+  pubTheme+
+  theme(legend.position="none", 
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  scale_color_viridis_c(option = "magma")+
+    scale_x_date(date_breaks = "12 months",
+             date_labels = "%b %Y",
+             expand=c(0,0))+
+    coord_cartesian(xlim=as.Date(c("2018-01-01","2023-01-01")))
+
+plot.step.clust
+ggsave(paste0(f.out,"/Overlaid_clust_Stepwise_2018.png"), width=8.5,height=5)
+```
+
+## Remake the plot of new cases in active clusters
+plot in ComparePrEPClsuter
+```{r}
+dtp.sero<-read.csv("../../04_prep/ComparePrEPClustering/2024-08-22_TablesOut/dtp.sero.csv")
+# table(dtp.sero$PREP)
+# dtp.sero2<-dtp.sero
+dtp.sero.clust<-dtp.sero %>% 
+  filter(cluster_YN==1) 
+dtp.sero.clust<-dtp.sero.clust[with(dtp.sero.clust,order(clusterSize)),]
+size.ord<-unique(dtp.sero.clust$clusterSize)
+dtp.sero.clust$clusterSize<-factor(dtp.sero.clust$clusterSize,levels=size.ord)
+
+
+dtp.sero.clust$PREP<-revalue(as.character(dtp.sero.clust$PREP), c("0"="No PrEP", "1"="PrEP"))
+dtp.sero.clust$PREP2<-factor(dtp.sero.clust$PREP,levels=c("PrEP","No PrEP"))
+ID.ord<-unique(dtp.sero.clust$clusterID) #these are ordered by size
+dtp.sero.clust$clusterID<-factor(dtp.sero.clust$clusterID,levels=ID.ord)
+
+### VERSION ANNOTATEED WITH CLUSTER ID 
+plot1z2<-ggplot(dtp.sero.clust)+
+  geom_bar(aes(x=clusterID,group=PREP,fill=PREP))+
+  pubTheme+
+  scale_fill_manual(breaks=c("PrEP","No PrEP"),values= c("maroon","orange3"))+
+  guides(fill=guide_legend(title="Newly\ndiagnosed"))+
+  labs(x="Active clusters (ID; size in Dec. 2022)",y="New diagnoses since 2018")+
+  theme(legend.position = c(0.1,0.75),
+        axis.text.x=element_blank(),
+        axis.ticks.x = element_blank())+
+  guides(fill=guide_legend(title="Newly\ndiagnosed"))+
+  geom_text(aes(x=clusterID,label=paste(clusterID,"; n=",clusterSize,sep=""),y=0),
+            angle=90,hjust=1,size=2.5)+
+  scale_y_continuous(expand=c(0.11,0.08))+
+  coord_cartesian(ylim=c(-10,70))
+plot1z2
+# ggsave(paste0(f.out,"/NewCasesinClustersByPrEP_ID.png"),height=2.8,width=8.5,units="in")
+```
+
+
+
+## Grob this together with the other plots for a new Fig S1
+```{r}
+# #read that plot in as an image
+# plot.draw.ncase<-cowplot::ggdraw() + cowplot::draw_image("../../04_prep/ComparePrEPClustering/2024-08-22_FiguresOut/NewCasesinClustersByPrEP_ID.png", scale = 1)
+
+plot_grid(plot1z2, plot.clustcases.month, plot.step.clust,
+          labels=LETTERS[1:3], ncol=1, rel_heights = c(0.8,1,1))
+ggsave(paste0(f.out,"/FigS1.composite.png"),width=8.5, height = 9.5)
+
+```
+
+
+
+## Plots stepwise additions of cluster members by Health Authority - can skip
+```{r}
+f.step.out<-paste(f.out,"/stepwise_clust_HA",sep="")
+if(!dir.exists(f.step.out)){dir.create(f.step.out)}
+
+# function that generates stepwise plot of counts by sample collection dates by location
+plot.stepwise.dates<-function(df){
+  if(nrow(df)>=n){ #only for sublineages >=20 
+    name<-df$clusterID[1]
+    df$FIRST_VL_DATE<-as.Date(df$FIRST_VL_DATE)
+    N<-paste0(": ",nrow(df)," cluster members")
+    df2 <- ddply(df,.(HA_NAME),transform,len=length(FIRST_VL_DATE))
+    maxlen<-max(df2$len)
+    ggplot(df2,aes(x=FIRST_VL_DATE,color=HA_NAME)) + 
+      geom_step(aes(len=len,y=..y.. * len),stat="ecdf",size=1)+ 
+      scale_x_date(date_breaks = "12 months", #date_minor_breaks = "2 weeks", 
+                 date_labels = "%Y")+
+      labs(x=NULL, y="Cluster members", color="HA", 
+           title=paste0("Cluster ",name,N))+
+      scale_color_manual(values=HAcolz)+
+      pubTheme+
+      theme(legend.position="none",title=element_text(size=7),
+            axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+      guides(col=guide_legend(nrow=2,title.position = "top"))
+    ggsave(paste(f.step.out,"/clust",name,"_StepwiseByHA",".png",sep=""),
+           width=5,height=5)
+  }
+}
+
+lapply(clust.list, plot.stepwise.dates)
+
+
+#Make a single legend 
+
+#Grob together some key examples later
+```
+
+## Plots stepwise additions of cluster members by population- can skip
+```{r}
+f.step.out.risk<-paste(f.out,"/stepwise_clust_risk",sep="")
+if(!dir.exists(f.step.out.risk)){dir.create(f.step.out.risk)}
+
+dtp.red$GRPRSK_new<-str_replace_all(dtp.red$GRPRSK, c("_RA"="",
+                                                "HETERO"="HET",
+                                                "IDU"="PWID",
+                                                "MSM"="MSM",
+                                                "BLOOD"="BLD",
+                                                "UNKNOWN"="NA",
+                                                "OTH/"="OTH" ))
+
+table(dtp.red$GRPRSK_new)
+rskz<-names(sort(table(dtp.red$GRPRSK_new)))
+RSKcolz<-colorRampPalette(colors=natparks.pals("Arches"))(length(rskz))
+names(RSKcolz)<-rskz
+
+# function that generates stepwise plot of counts by sample collection dates by location
+plot.stepwise.dates.risk<-function(df){
+  if(nrow(df)>=n){ #only for sublineages >=20 
+    name<-df$clusterID[1]
+    df$FIRST_VL_DATE<-as.Date(df$FIRST_VL_DATE)
+    N<-paste0(": ",nrow(df)," cluster members")
+    #make a new population that is simpler
+    df$GRPRSK_new<-str_replace_all(df$GRPRSK, c("_RA"="",
+                                                "HETERO"="HET",
+                                                "IDU"="PWID",
+                                                "MSM"="MSM",
+                                                "BLOOD"="BLD",
+                                                "UNKNOWN"="NA",
+                                                "OTH/"="OTH" ))
+    
+    df2 <- ddply(df,.(GRPRSK_new),transform,len=length(FIRST_VL_DATE))
+    maxlen<-max(df2$len)
+    ggplot(df2,aes(x=FIRST_VL_DATE,color=GRPRSK_new)) + 
+      geom_step(aes(len=len,y=..y.. * len),stat="ecdf",size=1)+ 
+      scale_x_date(date_breaks = "12 months", #date_minor_breaks = "2 weeks", 
+                 date_labels = "%Y")+
+      labs(x=NULL, y="Cluster members", color="HA", 
+           title=paste0("Cluster ",name,N))+
+      scale_color_manual(values=RSKcolz)+
+      pubTheme+
+      theme(title=element_text(size=7),legend.position="none",#"bottom" ,
+            axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+      guides(col=guide_legend(nrow=2,title.position = "top"))
+    ggsave(paste(f.step.out.risk,"/clust",name,"_StepwiseByRisk",".png",sep=""),
+           width=4,height=3)
+  }
+}
+
+lapply(clust.list, plot.stepwise.dates.risk)
+
+```
+
+## Plots of cluster case incidence by HA- can skip
+```{r}
+## change this to make it number of new cases per month
+f.inc.out<-paste(f.out,"/incidence_clust",sep="")
+if(!dir.exists(f.inc.out)){dir.create(f.inc.out)}
+
+plot.incidence<-function(df){
+  if(nrow(df)>=n){ #only for sublineages >=10
+    name<-df$clusterID[1]
+    N<-paste0(": ",nrow(df)," cluster members")
+
+    df$FIRST_VL_DATE<-as.Date(df$FIRST_VL_DATE)
+    
+    ## change this to add quarter, group by quarter and count occurences
+    df$quarter<-quarter(df$FIRST_VL_DATE, type = "date_first")
+    df2<-df %>% dplyr::group_by(quarter, HA_NAME) %>% tally() %>% as.data.frame()
+    min(df2$quarter)
+    ggplot(df2,aes(x=as.Date(quarter))) +
+      geom_bar(aes(y=n,fill=HA_NAME),stat="identity")+
+      scale_x_date(date_breaks = "12 months",
+                 date_labels = "%Y", 
+                 limits=c(min(as.Date(df2$quarter)),as.Date("2023-02-02")),expand=c(0,0))+
+      scale_fill_manual(values=HAcolz)+
+      labs(x=NULL, y="New members, by quarter",
+           title=paste0("Cluster ",name,N))+
+      pubTheme+
+      theme(title=element_text(size=7),legend.position="none", #"bottom",
+            axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.5)))
+      
+    ggsave(paste(f.inc.out,"/clust",name,"_CasesOverTime",".png",sep=""),
+           width=4,height=3)
+  }
+}
+
+lapply(clust.list, plot.incidence)
+
+```
+
+## Plots of cluster case incidence by risk group - can skip
+```{r}
+## change this to make it number of new cases per month
+f.inc.rsk.out<-paste(f.out,"/incidence_clust_rsk",sep="")
+if(!dir.exists(f.inc.rsk.out)){dir.create(f.inc.rsk.out)}
+
+plot.incidence.rsk<-function(df){
+  if(nrow(df)>=n){ #only for sublineages >=10
+    name<-df$clusterID[1]
+    N<-paste0(": ",nrow(df)," cluster members")
+
+    df$FIRST_VL_DATE<-as.Date(df$FIRST_VL_DATE)
+    #make a new risk group that is simpler
+    df$GRPRSK_new<-str_replace_all(df$GRPRSK, c("_RA"="",
+                                                "HETERO"="HET",
+                                                "IDU"="PWID",
+                                                "MSM"="MSM",
+                                                "BLOOD"="BLD",
+                                                "UNKNOWN"="NA",
+                                                "OTH/"="OTH" ))
+    
+    ## change this to add quarter, group by quarter and count occurences
+    df$quarter<-quarter(df$FIRST_VL_DATE, type = "date_first")
+    df2<-df %>% dplyr::group_by(quarter,GRPRSK_new) %>% tally() %>% as.data.frame()
+    min(df2$quarter)
+    ggplot(df2,aes(x=as.Date(quarter))) +
+      geom_bar(aes(y=n,fill=GRPRSK_new),stat="identity")+
+      scale_x_date(date_breaks = "12 months",
+                 date_labels = "%Y", 
+                 limits=c(min(as.Date(df2$quarter)),as.Date("2023-02-02")),expand=c(0,0))+
+      scale_fill_manual(values=RSKcolz)+
+      labs(x=NULL, y="New members, by quarter",
+           title=paste0("Cluster ",name,N))+
+      pubTheme+
+      theme(title=element_text(size=7),legend.position="none", #"bottom",
+            axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=rel(0.5)))
+      
+    ggsave(paste(f.inc.rsk.out,"/clust",name,"_CasesOverTime_Rsk",".png",sep=""),
+           width=4,height=3)
+  }
+}
+
+lapply(clust.list, plot.incidence.rsk)
+
+```
+
+# Cluster alignments
+## Make a fasta export for each cluster- can skip
+```{r}
+#find all pol seq IDs matching
+all.patz<-dtp.red2$PATID
+# all.patz
+
+pol<-read.FASTA(pol.in)
+pol<-pol[-1] #ref seq
+seqnames<-names(pol)
+head(seqnames)
+seqnames[10894]<-"1055926026_23296412_E91558-DRT_2010-11-16" #manual change of extra _
+
+#split strings to match on patid
+seqdf<-data.frame(seqID=seqnames)
+seqdf<-seqdf %>% separate(col=seqID, into=LETTERS[1:4],sep="_", remove = F)
+
+#cool, now try to match patids from a given cluster
+my.clust<-clust.list[[1]]
+my.pats<-my.clust$PATID
+
+#do all pats have at least one match?
+length(my.pats) #471
+length(my.pats)==length(which(my.pats %in% seqdf$A))
+my.seqs<-which(seqdf$A %in% my.pats)
+length(my.seqs) #2064 (because multiples per patient)
+my.fasta<-pol[my.seqs] #ordered the same
+
+#export a complete fasta (all seqs from matching pats) for big clusters
+get.all.cluster.fasta<-function(df){
+  if(nrow(df)>=5){
+    name<-df$clusterID[1]
+    my.pats<-df$PATID
+    my.seqs<-which(seqdf$A %in% my.pats)
+    my.fasta<-pol[my.seqs]
+    #export the fasta
+    write.FASTA(my.fasta, paste0(fast.out,"/clust_",name,"_allSeqs.fasta"))
+  }
+}
+lapply(clust.list, get.all.cluster.fasta)
+
+## Make a reduced alignment with only the oldest seq for each patient
+#go through seq.df and assign 0,1 based on oldest
+#note that the sequences are ordered by patid and then by date (how nice of past me :) )
+seqdf$oldest<-0
+unq.pat<-unique(seqdf$A)
+for (i in 1:length(unq.pat)){
+  mypat<-unq.pat[i]
+  oldest<-which(seqdf$A == mypat)[1] #first is oldest
+  seqdf$oldest[oldest]<-1
+}
+# table(seqdf$oldest)[2]==length(unq.pat)
+#oldest only alignment
+pol.old<-pol[which(seqdf$oldest==1)]
+# length(pol.old)
+seqdf.old<-seqdf[which(seqdf$oldest==1),]
+
+#export a reduced fasta (oldest seq frmo matching pats)
+get.old.cluster.fasta<-function(df){
+  if(nrow(df)>=n){
+    name<-df$clusterID[1]
+    my.pats<-df$PATID
+    my.seqs<-which(seqdf.old$A %in% my.pats)
+    my.fasta<-pol.old[my.seqs]
+    #export the fasta
+    write.FASTA(my.fasta, paste0(fast.out,"/clust_",name,"_OldestSeq.fasta"))
+  }
+}
+lapply(clust.list, get.old.cluster.fasta)
+
+## REPEAT with unmasked data - useful for calling DRMs in clusters
+
+## Make a reduced alignment with only the oldest seq for each patient
+pol.un<-read.FASTA(pol.unmask.in)
+
+pol.un<-pol.un[-c(1:3)] #ref seq
+seqnames.un<-names(pol.un)
+head(seqnames.un)
+str_which(seqnames.un,"23296412")
+seqnames.un[10894]<-"1055926026_23296412_E91558-DRT_2010-11-16" #manual change of extra _
+
+#split strings to match on patid
+seqdf.un<-data.frame(seqID=seqnames.un)
+seqdf.un<-seqdf.un %>% separate(col=seqID, into=LETTERS[1:4],sep="_", remove = F)
+
+#generate oldest list, as above
+seqdf.un$oldest<-0
+unq.pat.un<-unique(seqdf.un$A)
+for (i in 1:length(unq.pat.un)){
+  mypat<-unq.pat.un[i]
+  oldest<-which(seqdf.un$A == mypat)[1] #first is oldest
+  seqdf.un$oldest[oldest]<-1
+}
+
+#oldest only alignment
+pol.un.old<-pol.un[which(seqdf.un$oldest==1)]
+
+# length(pol.old)
+seqdf.un.old<-seqdf.un[which(seqdf.un$oldest==1),]
+
+#export a reduced fasta (unmasked all seqs)
+get.un.old.cluster.fasta<-function(df){
+  if(nrow(df)>=n){
+    name<-df$clusterID[1]
+    my.pats<-df$PATID
+    my.seqs<-which(seqdf.un.old$A %in% my.pats)
+    my.fasta<-pol.un.old[my.seqs]
+    #export the fasta
+    write.FASTA(my.fasta, paste0(fast.out,"/clust_",name,"_OldestSeq_Unmasked.fasta"))
+  }
+}
+lapply(clust.list, get.un.old.cluster.fasta)
+
+
+#unmasked and all seqs not just oldest
+#export a reduced fasta (unmasked all seqs)
+get.un.cluster.fasta<-function(df){
+  if(nrow(df)>=1){
+    name<-df$clusterID[1]
+    my.pats<-df$PATID
+    my.seqs<-which(seqdf.un.old$A %in% my.pats)
+    my.fasta<-pol.un.old[my.seqs]
+    #export the fasta
+    write.FASTA(my.fasta, paste0(fast.out,"/clust_",name,"_pol_unmask.fasta"))
+  }
+}
+lapply(clust.list, get.un.cluster.fasta)
+
+```
+
+# Cluster Re modelling 
+## estimate Re for multiple serial interval params - can skip
+```{r}
+# R.list<-replicate(length(big.ones),vector())
+# 
+# #mke a restrcited list of big clusts 
+# # big.ones<-unq.clust$clusterID[which(unq.clust$size>=n)] #n=10
+# clust.big<-clust.list[which(names(clust.list) %in% big.ones)]
+# 
+# ## SET OF PARAMETERS TO TRY
+# mean.si.set<-c(floor(365/2), 365, 2*365) #0.5, 1 and 2 years
+# std.si.set<-c(floor(365/2),365) # 0.5 and 1 year
+# int.set<-c(floor(365/2), 365) #0.5, 1 year
+# 3*2*2 #12 paramsets
+# 
+# ## all combinations
+# param.set<-expand_grid(mean.si.set,std.si.set,int.set)
+# 
+# ## LOOP across all param sets
+# for (k in 1:nrow(param.set)){ #NEED TO RERUN THIS FOR OTHER PARAM SETS IF WANT TO COMPARE with new smoothing
+# # for(k in 5){ #test on one paramset
+#   mean.si<-param.set$mean.si.set[k]
+#   std.si<-param.set$std.si.set[k]
+#   int<-param.set$int.set[k]
+# 
+#   #make a folder for outputs named based on parameters
+#   f.Rt<-paste0(f.out,"/Rt_epi_mean",mean.si,"_std",std.si,"_int",int)
+#   if(!dir.exists(f.Rt)){dir.create(f.Rt)}
+#   
+#   #for each big cluster
+#   for (j in 1:length(clust.big)){
+#     #incidence count for each day
+#     newcases<-clust.big[[j]] %>% 
+#       dplyr::group_by(FIRST_VL_DATE) %>% 
+#       dplyr::summarize(.groups="rowwise",count=n()) %>%
+#       as.data.frame()
+#     #some in clust9999 no date
+#     if(any(is.na(newcases$FIRST_VL_DATE))){newcases<-newcases[-which(is.na(newcases$FIRST_VL_DATE)),]}
+#     INC<-incidence::as.incidence(newcases$count, dates = newcases$FIRST_VL_DATE)
+#     colnames(newcases)<-c("dates","I")
+#     newcases$dates<-as.Date(newcases$dates)
+#     
+#     #Fill in missing dates (need a row for every day in between new cases)
+#     dates.vector<-as.Date(as.Date(first(sort(newcases$dates))):as.Date(last(sort(newcases$dates))),origin="1970-01-01")
+#     newcases2<-data.frame(dates=dates.vector, I=0)
+#     for (i in 1:nrow(newcases)){
+#       if (newcases$I[i]>0){
+#         match<-which(newcases2$dates==newcases$dates[i])
+#         newcases2$I[match]<-newcases$I[i]
+#       }
+#     }
+#     #Setup intervals
+#     T <- nrow(newcases2)
+#     t_start <- seq(2, T-int) # starting at 2 as conditional on the past observations
+#     t_end <- t_start + int # adding interval sized windows as bounds included in window
+#     
+#     #configure serial interval
+#     config <- make_config(list(t_start=t_start,t_end=t_end,
+#                                mean_si = mean.si, 
+#                               std_si = std.si))
+#     # Estimate Rt
+#     res_param_si<-EpiEstim::estimate_R(newcases2, 
+#                                     method="parametric_si",
+#                                     config = config)
+#     
+#     #extract the R over time for each cluster into a new df in a list
+#     R.list[[j]]<-res_param_si$R
+#     #convert t start and end to dates
+#     start=as.Date(newcases2$dates[1])
+#     R.list[[j]]$date_start<-start+as.numeric(R.list[[j]]$t_start)
+#     R.list[[j]]$date_end<-start+as.numeric(R.list[[j]]$t_end)
+#     R.list[[j]]$clusterID<-names(clust.big)[[j]]
+# 
+#     ## Add a smoothing step - note that this was previously outisde looop by mistake - now inside and working properly
+#     smooth.w<-90
+#     
+#     R.list[[j]]$meanR_smooth<-zoo::rollmean(R.list[[j]]$`Mean(R)`,k=smooth.w, align="right", fill = NA)
+#     R.list[[j]]$quant0.05_smooth<-zoo::rollmean(R.list[[j]]$`Quantile.0.05(R)`,k=smooth.w,align="right", fill = NA)
+#     R.list[[j]]$quant0.95_smooth<-zoo::rollmean(R.list[[j]]$`Quantile.0.95(R)`,k=smooth.w,align="right", fill = NA)
+#     R.list[[j]]$quant0.25_smooth<-zoo::rollmean(R.list[[j]]$`Quantile.0.25(R)`,k=smooth.w,align="right", fill = NA)
+#     R.list[[j]]$quant0.75_smooth<-zoo::rollmean(R.list[[j]]$`Quantile.0.75(R)`,k=smooth.w,align="right", fill = NA)
+# 
+#     ## where insufficient prior data: use raw
+#     nadat<-which(is.na(R.list[[j]]$meanR_smooth) & !is.na(R.list[[j]]$`Mean(R)`))
+#     R.list[[j]]$meanR_smooth[nadat]<-R.list[[j]]$`Mean(R)`[nadat]
+#     R.list[[j]]$quant0.05_smooth[nadat]<-R.list[[j]]$`Quantile.0.05(R)`[nadat]
+#     R.list[[j]]$quant0.95_smooth[nadat]<-R.list[[j]]$`Quantile.0.95(R)`[nadat] 
+#     R.list[[j]]$quant0.25_smooth[nadat]<-R.list[[j]]$`Quantile.0.25(R)`[nadat]
+#     R.list[[j]]$quant0.75_smooth[nadat]<-R.list[[j]]$`Quantile.0.75(R)`[nadat]
+#   
+#   } #cluster loop
+#   
+#   # Export the R values over time as one big df for each param set
+#   R.df<-do.call("bind_rows", R.list)
+#   write.csv(R.df, paste0(f.Rt,"/clust_Rt_epiestim_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+# 
+#   ## Plot big (>=10) clusters' Re over time - smoothed
+#   for (i in 1:length(big.ones)){
+#     R.df %>%
+#     filter(clusterID==big.ones[i]) %>%
+#     ggplot()+
+#     geom_line(aes(x=date_start, y=meanR_smooth), color="darkblue")+
+#       #ADD quantiles
+#     geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth,ymax=quant0.95_smooth),fill="darkblue",alpha=0.25)+
+#     geom_hline(yintercept = 1,color="red4",linetype=2)+
+#     labs(y="Re",x=NULL)+
+#     scale_x_date(date_breaks = "12 months", date_labels = "%b %Y")+
+#     pubTheme+
+#     theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+#     #save it
+#     ggsave(paste0(f.Rt,"/Rt_clust_",big.ones[i],"_smooth.png"),height=4,width=6)
+#   }
+#   
+# 
+# } #param set loop
+
+```
+
+
+# Clusters' growth rate r by month, year, two years
+```{r}
+# r<-newcases/time/infected pop size
+#time step: per yearmonth, but then can *12 to get in peryear
+#infected pop size is the cumulative cluster members (subtracting those who died)
+#don't need to think about migrants (prev_ARV=1) b/c imported cases sshouldn't be joining clusters
+
+#for each cluster:
+#calculate the cumulative members or cluster size at each year month = 
+ # cluster size at last yearmonth + 
+ # new cases in yearmonth -
+ # deaths in yearmonth
+#calculate growth rate r 
+#r=newcases per ym/cluster size in ym
+
+#set up an empty list with a df for each cluster
+clust.grow<-replicate(n=n.clust, vector())
+period.clust.grow<-replicate(n=n.clust, vector())
+
+# calc cluster size (prevalent population) over time
+# prevalent cluster size= cluster size (t-1) + new cases in cluster (delta t) - deaths in cluster
+for (i in 1:n.clust){
+  #add year month of first vl as time step
+  clust.list[[i]]$yearmonth<-zoo::as.yearmon(clust.list[[i]]$FIRST_VL_DATE)
+  
+  #add year month of death 
+  clust.list[[i]]$end.yearmonth<-zoo::as.yearmon(clust.list[[i]]$END_FOLLOW_DT.x)
+  
+  #range of dates for this cluster
+  na.date<-which(is.na(clust.list[[i]]$FIRST_VL_DATE))
+  if(length(na.date)>0){clust.list[[i]]<-clust.list[[i]][-na.date,]}
+  dt.range<-range(clust.list[[i]]$FIRST_VL_DATE)
+  
+  #set of complete yearmonths in range
+  ym.range<-seq(as.Date(dt.range[1]),as.Date(dt.range[2]),by="months") %>% zoo::as.yearmon () %>% as.data.frame()
+  colnames(ym.range)<-"yearmonth"
+  
+  #count new cases in each year month (each row is a new member, with year month of first VL as proxy diag date)
+  newcases<-clust.list[[i]] %>% dplyr::group_by(yearmonth) %>% tally() %>% as.data.frame()
+  colnames(newcases)<-c("yearmonth","n.new")
+  
+  #count new deaths in each yearmonth
+  deadcases<-clust.list[[i]] %>% filter(END_FOLLOW_STATUS.x %in% c("death_non_accid","death_accid")) %>%
+    dplyr::group_by(end.yearmonth) %>% tally() %>% as.data.frame()
+  colnames(deadcases)<-c("yearmonth","n.dead")
+  
+  #join together for full ym range
+  ym.c<-left_join(ym.range, newcases, by="yearmonth")
+  ym.c.d<-left_join(ym.c, deadcases, by="yearmonth")
+  
+  #change NAs to zeroes
+  ym.c.d$n.new[which(is.na(ym.c.d$n.new))]<-0
+  ym.c.d$n.dead[which(is.na(ym.c.d$n.dead))]<-0
+
+  #col for running cluster size # USE THIS FOR SEED BELOW
+  ym.c.d$size<-NA
+  for(j in 1:nrow(ym.c.d)){
+    if(j==1) {ym.c.d$size[j]<-ym.c.d$n.new[j]; next}
+    #otherwise add previous size to new - dead
+    ym.c.d$size[j] <- ym.c.d$size[j-1] + ym.c.d$n.new[j] - ym.c.d$n.dead[j]
+  }
+  
+  #Now we can calculate growth rate [per year] at each step
+  ym.c.d<- ym.c.d %>% mutate(growthrate=n.new / size *12)
+  
+  #Take the rolling average
+  ym.c.d<- ym.c.d %>% mutate(growthrate.smooth = zoo::rollmean(growthrate, k=12,fill=NA,align = "right"))
+  #where no rolling average b/c not enough dat, just use raw
+  ym.c.d$growthrate.smooth[1:11]<-ym.c.d$growthrate[1:11]
+    
+  #identify which period of the BC HIV epidemic
+  ##https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5640311/
+  ym.c.d$period<-NA
+  for (j in 1:nrow(ym.c.d)){
+    ym<-zoo::as.Date.yearmon(ym.c.d$yearmonth[j]) 
+    if (ym<as.Date("2000-01-01")) {ym.c.d$period[j]<-"Early_HAART"; next}
+    if (ym>=as.Date("2000-01-01") & ym<as.Date("2006-01-01")) {ym.c.d$period[j]<-"Harm_reduction"; next}
+    if (ym>=as.Date("2006-01-01") & ym<as.Date("2010-01-01")) {ym.c.d$period[j]<-"Early_TaSP"; next}
+    if (ym>=as.Date("2010-01-01") & ym<as.Date("2016-01-01")) {ym.c.d$period[j]<-"STOP_HIVAIDS"; next}
+    if (ym>=as.Date("2016-01-01") & ym<as.Date("2018-01-01")) {ym.c.d$period[j]<-"Before_PrEP"; next}
+    if (ym>=as.Date("2018-01-01") & ym<as.Date("2020-03-01")) {ym.c.d$period[j]<-"PrEP_pre-COVID19"; next}
+    if (ym>=as.Date("2020-03-01") & ym<as.Date("2022-01-01")) {ym.c.d$period[j]<-"PrEP_COVID19"; next}
+    if (ym>=as.Date("2022-01-01") & ym<as.Date("2023-03-01")) {ym.c.d$period[j]<-"PrEP_post-COVID19"}
+  }
+  # table(ym.c.d$period)
+
+  #Calculate period average using each ym growth rate and prev 12 mo average
+  ym.c.d.per<-ym.c.d %>% dplyr::group_by(period) %>% dplyr::summarize(mean.growth = mean(growthrate), 
+                                                        stdev.growth = sd(growthrate),
+                                                        mean.growth.smooth = mean(growthrate.smooth),
+                                                        stdev.growth.smooth = sd(growthrate.smooth)) %>% as.data.frame()
+  
+  #Make wide
+  ym.c.d.per.wide<-ym.c.d.per %>% pivot_wider(names_from=period, values_from = 2:5)
+  #reutrn period cluster growth rate dataframe
+  ym.c.d.per.wide$clusterID<-clust.list[[i]]$clusterID[1]
+
+  period.clust.grow[[i]]<-ym.c.d.per.wide
+  
+  #return full growth rate df into a df within list 
+  ym.c.d$clusterID<-clust.list[[i]]$clusterID[1]
+  clust.grow[[i]]<-ym.c.d
+  
+} #end loop, takes ~30 sec
+
+## Ok, check it all worked
+# head(clust.grow[[i]])
+# head(period.clust.grow[[i]])
+
+# bind rows in the list
+all.clust.grow<-bind_rows(clust.grow)
+
+#write it to analyze in separate script or could read in below
+write.csv(all.clust.grow, paste0(f.out,"/all.clust.growth.rate.ym.csv"))
+
+#bind all rows here also
+all.period.clust.grow<-bind_rows(period.clust.grow)
+
+## quantify FC in average growth rate from period before to during PrEP; and qualify if signif lower
+#FC from ave before PrEP to druning PrPE
+all.period.clust.grow<-all.period.clust.grow %>% mutate(FC.before.during.mean =`mean.growth_PrEP_pre-COVID19`/ mean.growth_Before_PrEP,
+                                 FC.before.during.mean.smooth =`mean.growth.smooth_PrEP_pre-COVID19`/ mean.growth.smooth_Before_PrEP)
+# all.period.clust.grow$FC.before.during.mean.smooth
+
+#with FC
+write.csv(all.period.clust.grow, paste0(f.out,"/all.period.clust.growth.rate.ym.csv"))
+```
+
+
+## Join clust composition to growth rate summaries 
+```{r}
+#calculate percent of clusters by risk group with reduced growth following prep
+
+# what % of GBM clusters had signif reduced Re and growth rates pre vs durign PrEP
+cluster.fuk<-left_join(clust.comp,all.period.clust.grow,  by="clusterID")
+## filter for those active since 2018, what percent of clusters predominated by each risk group had reduced growth rate before vs during prep
+
+cluster.fuk %>% 
+  filter(active==1) %>%
+  dplyr::summarise(totalclust=n(),
+                   total.red=length(which(FC.before.during.mean>=1)),
+                   total.smooth.red=length(which(FC.before.during.mean.smooth>=1)),
+                   perc.red=total.red/totalclust *100)
+#oevrall active clusters:
+# totalclust 84
+# total.red 28
+# total.smooth.red 	31
+# perc.red 	33.33333	
+
+cluster.fuk %>% 
+  filter(active==1) %>%
+  dplyr::group_by(risk) %>% 
+  dplyr::summarise(totalclust=n(),
+                   total.red=length(which(FC.before.during.mean<=1)),
+                   total.smooth.red=length(which(FC.before.during.mean.smooth<=1)),
+                   perc.red=total.red/totalclust *100)
+# 24/53 45.2% GBM active clusters had reduced growth rate, compared to 16.7% of PWID clusters (5/30)
+
+```
+
+## Read in the "best" Rt estimates (serial interval priors most realistic)
+```{r}
+#favesies
+mean.si<-365
+std.si<-182
+int<-182
+
+#Use summaries from today or prev run
+Rt.f.in<-f.out
+Rt.f.in<-"2024-05-31_Results"
+
+f.Rt<-paste0(Rt.f.in,"/Rt_epi_mean",mean.si,"_std",std.si,"_int",int)
+clust.rt<-read.csv(paste0(f.Rt,"/clust_Rt_epiestim_mean",mean.si,"_std",std.si,"_int",int,".csv"))
+# head(clust.rt)
+
+##FORMAT
+clust.rt$date_start<-as.Date(clust.rt$date_start)
+clust.rt$date_end<-as.Date(clust.rt$date_end)
+
+#how big?
+nrow(clust.rt) #GONNA BE HUGE.
+
+#remove NA before date X and reduce cols to what is needed
+# length(which(is.na(clust.rt$meanR_smooth)))
+# length(which(is.na(clust.rt$Mean.R.)))
+length(which(is.na(clust.rt$Mean.R.)))
+clust.rt<-clust.rt %>% filter(!is.na(clust.rt$Mean.R.))
+# clust.rt<-clust.rt %>% select(clusterID, date_start, date_end, Mean.R., meanR_smooth)
+
+### EXCLUDE observations where the uncertainty interval is wider than X
+#calculate width
+clust.rt<-clust.rt %>% mutate(CI.width=quant0.95_smooth - quant0.05_smooth) #Quantile.0.95.R. - Quantile.0.05.R.)
+#look at quantiles or distrib of width to decide what is too wide          
+summary(clust.rt$CI.width) #median 5.6, mean 7.5 - prettty uncertain
+
+#CI Width plot
+ggplot(clust.rt)+
+  geom_density(aes(x=CI.width))
+
+#what percent of data over too wide? reduce to 8?
+wide<-10
+length(which(clust.rt$CI.width>=wide))/nrow(clust.rt) #55% of data >=5; 42% of data >=7; 37% >=8; 31% >=10
+
+#add an indicator variable based on whether it is too wide
+clust.rt<-clust.rt %>% mutate(too.wide = CI.width>=wide)
+table(clust.rt$too.wide)/nrow(clust.rt) 
+
+#then filter on it below before taking the average
+clust.rt.cln <- clust.rt %>% 
+  filter(too.wide==FALSE) 
+
+## Also excludes observations that default to mean=5 
+# table(clust.rt$Quantile.0.05.R.[which(clust.rt$Mean.R.==5)])
+# table(clust.rt$Quantile.0.95.R.[which(clust.rt$Mean.R.==5)])
+# table(clust.rt$CI.width[which(clust.rt$Mean.R.==5)]) #14.7
+#these should be excluded as having too wide of int anyways...
+
+## join to clust comp 
+clust.rt.mod<-clust.rt.cln %>% left_join(clust.comp, by="clusterID")
+```
+
+## Make nice plots of cluster-level Rt for key clusters with smaller axes and excluding data where too-wide
+```{r}
+## focus clusters
+foc.clust<-c(31,95,22, 114, 142,49,57,137) #two new
+# full set of clustres with>=10new cases
+
+#add two more here
+# key.clust
+# bigger.ones
+# cl.highR
+# cl.mostcase 
+# 
+clust.comp[clust.comp$clusterID=="114",]
+cluster.fuk$n_seroconv_2018[cluster.fuk$clusterID=="114"]
+# 
+# clust.comp[clust.comp$clusterID=="41",]
+# cluster.fuk$n_seroconv_2018[cluster.fuk$clusterID=="41"]
+# 
+clust.comp[clust.comp$clusterID=="142",]
+cluster.fuk$n_seroconv_2018[cluster.fuk$clusterID=="142"]
+
+# clust.comp[clust.comp$clusterID=="217",]
+# cluster.fuk$n_seroconv_2018[cluster.fuk$clusterID=="217"]
+
+#give clusterID panels new names with descriptive
+clust.rt.mod$clusterID.mod<-str_replace_all(as.character(clust.rt.mod$clusterID), 
+                                            c("31"="Cluster 31\nsize=391 , new=94, 89% GBM",
+                                              "95"="Cluster 95\nsize=158, new=27, 92% GBM",
+                                              "22"="Cluster 22\nsize=42, new=19, 100% GBM",
+                                              "114"="Cluster 114\nsize=14, new=14, 93% GBM",
+                                              "142"="Cluster 142\nsize=62, new=6, 75% GBM, 20% PWID",
+                                              
+                                              "49"="Cluster 49\nsize=459, new=11, 91% PWID",
+                                              "57"="Cluster 57\nsize=471, new=19, 86% PWID",
+                                              "137"="Cluster 137\nsize=90, new=26, 88% PWID"))
+foc.clust.mod<-unique(clust.rt.mod$clusterID.mod[match(foc.clust,clust.rt.mod$clusterID)])
+ymax4<-10
+
+clust.rt.mod.2<-clust.rt.mod  %>%
+  filter(clusterID %in% foc.clust)
+clust.rt.mod.2$clusterID<-factor(clust.rt.mod.2$clusterID,levels=foc.clust)
+clust.rt.mod.2$clusterID.mod<-factor(clust.rt.mod.2$clusterID.mod,levels=foc.clust.mod)
+
+ymax4<-max(clust.rt.mod.2$meanR_smooth,na.rm=T)
+facet.clust<-clust.rt.mod.2 %>%
+  ggplot()+
+  #vertical line/annotation for PREP wide available
+  geom_vline(xintercept = as.Date("2018-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2018-01-01"),
+           y = ymax4,hjust=-0.1,vjust=1.2, label="PrEP", color="black",size=2.5)+
+  #vertical line/annotation for COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),linetype=2,size=0.7, alpha=0.6)+
+  annotate(geom="text", x = as.Date("2020-03-01"),
+           y = ymax4,hjust=-0.1,vjust=1.2, label="COVID-19", color="black",size=2.5)+
+  #vertical line for post-COVID-19 2022-onwards
+  geom_vline(xintercept = as.Date("2022-01-01"),linetype=2,size=0.7, alpha=0.6)+
+  # annotate(geom="text", x = as.Date("2022-01-01"),
+           # y = ymax4,hjust=-0.1,vjust=1.2, label="post-COVID-19", color="black",size=2.5)+
+  #DATA
+  geom_line(aes(x=date_start, y=meanR_smooth, color=risk, group=clusterID.mod))+
+  #ADD quantiles
+  geom_ribbon(aes(x=date_start,ymin=quant0.05_smooth,ymax=quant0.95_smooth, fill=risk, group=clusterID.mod),alpha=0.25)+
+  geom_hline(yintercept = 1,color="red4",linetype=2)+
+  labs(y="Re",x=NULL)+
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y",
+                limits=c(as.Date("2015-01-01"),as.Date("2022-12-31")),expand=c(0,0))+
+  scale_y_continuous(breaks=seq(0,10,1))+
+  pubTheme+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1), legend.position = "none")+
+  facet_wrap(~clusterID.mod, nrow=2)+
+  coord_cartesian(ylim=c(0,ymax4))+
+  scale_color_manual(values=riskcolz)+
+  scale_fill_manual(values=riskcolz)
+facet.clust
+#save it CROI figure
+ggsave(paste0(f.out,"/Rt_clust_bigactive_facet.png"),height=4,width=10)
+
+```
+
+## Cluster Rt period averages and Fold-Change
+```{r}
+#currently set into 182 day estimating intervals, but every day has a 6 month period - let's take the date_end-90 as the date representing each period, 
+
+## MAKE period variable to group dates
+clust.rt$period<-NA
+
+#use date_start as lower limit
+clust.rt$period [which(clust.rt$date_end<as.Date("2000-01-01"))] <-"Early_HAART"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2000-01-01") &
+                       clust.rt$date_end<as.Date("2006-01-01"))] <-"Harm_reduction"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2006-01-01") &
+                       clust.rt$date_end<as.Date("2010-01-01"))] <-"Early_TasP"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2010-01-01") &
+                       clust.rt$date_end<as.Date("2016-01-01"))] <-"STOP_HIVAIDS"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2016-01-01") &
+                       clust.rt$date_end<as.Date("2018-01-01"))] <-"Before_PrEP"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2018-01-01") &
+                       clust.rt$date_end<as.Date("2020-03-01"))] <-"PrEP_pre-COVID19"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2020-03-01") &
+                       clust.rt$date_end<as.Date("2022-03-01"))] <-"PrEP_COVID19"
+clust.rt$period [which(clust.rt$date_end>=as.Date("2022-03-01") &
+                       clust.rt$date_end<as.Date("2023-03-01"))] <-"PrEP_post-COVID19"
+table(clust.rt$period)
+
+#no longer no NA with the way we have it... previously all date_end
+# any(is.na(clust.rt$period)) #great wow
+
+
+#Calculate period average for each cluster using each 
+#here have to add cluster ID in the grouping b/c not split as for growth rate above
+#each day (rather than each month) contribs equally to the mean in that period
+clust.rt.per<-clust.rt%>% #filter out observations where the CI is too wide to be trusted
+  filter(too.wide==FALSE) %>%
+  dplyr::group_by(clusterID, period) %>% 
+  dplyr::summarize(.groups="rowwise",mean.re = mean(Mean.R.), 
+                                                      stdev.re= sd(Mean.R.),
+                                                      mean.re.smooth = mean(meanR_smooth,na.rm=T),
+                                                      stdev.re.smooth = sd(meanR_smooth,na.rm=T)) %>% as.data.frame()
+
+## IF a period average is NA, make it 0.8 (receding invisibly) but could re-arise at anytime
+na.time<-which(is.na(clust.rt.per$mean.re.smooth))
+clust.rt.per$mean.re.smooth[na.time]<-0.8
+
+#Make wide
+all.period.clust.rt.grow<-clust.rt.per %>% pivot_wider(names_from=period, values_from = 3:6)
+
+## quantify FC in average re rate from period before to during PrEP; and qualify if signif lower
+#FC from ave before PrEP to druning PrPE
+all.period.clust.rt.grow<-all.period.clust.rt.grow %>% mutate(FC.before.during.mean = `mean.re_PrEP_pre-COVID19`/ mean.re_Before_PrEP,
+                                 FC.before.during.mean.smooth = `mean.re.smooth_PrEP_pre-COVID19`/ mean.re.smooth_Before_PrEP)
+# table(all.period.clust.rt.grow$FC.before.during.mean.smooth)
+
+#Do this again, but calculate a covid effect and post covid effect
+all.period.clust.rt.grow2<-clust.rt.per %>% pivot_wider(names_from=period, values_from = 3:6)
+all.period.clust.rt.grow2<-all.period.clust.rt.grow2 %>% mutate(
+  #PREP EFFECT (during/before)
+  FC.beforeprep.during.mean.smooth = `mean.re.smooth_PrEP_pre-COVID19`/`mean.re.smooth_Before_PrEP`,
+  #COVID EFFECT
+  FC.covid.mean.smooth = `mean.re.smooth_PrEP_COVID19`/ `mean.re.smooth_PrEP_pre-COVID19`,
+  #POST COVID EFFECT
+  FC.postcovid.mean.smooth = `mean.re.smooth_PrEP_post-COVID19`/`mean.re.smooth_PrEP_COVID19`)
+# table(all.period.clust.rt.grow$FC.before.during.mean.smooth)
+
+## connect to cluster comp
+all.period.clust.rt.grow3<-all.period.clust.rt.grow2 %>% left_join(clust.comp, by="clusterID")
+ 
+# ggplot(all.period.clust.rt.grow3)+
+#   geom_boxplot(aes(y=FC.covid.mean.smooth, color=risk))
+# 
+# ggplot(all.period.clust.rt.grow3)+
+#   geom_boxplot(aes(y=FC.postcovid.mean.smooth, color=risk))
+
+
+#RANGE OF EFFECTS by risk 
+effect.summz<-all.period.clust.rt.grow3 %>% dplyr::group_by(risk) %>% filter(risk !="HET") %>%
+  dplyr::summarise(minprep=min(FC.beforeprep.during.mean.smooth,na.rm=T),
+                   maxprep=max(FC.beforeprep.during.mean.smooth,na.rm=T),
+                   medianprep=median(FC.beforeprep.during.mean.smooth,na.rm=T),
+                   meanprep=mean(FC.beforeprep.during.mean.smooth),
+
+                   mincovid=min(FC.covid.mean.smooth,na.rm=T),
+                   maxcovid=max(FC.covid.mean.smooth,na.rm=T),
+                   mediancovid=median(FC.covid.mean.smooth,na.rm=T),
+                   meancovid=mean(FC.covid.mean.smooth,na.rm=T),
+
+                   minpostcovid=min(FC.postcovid.mean.smooth,na.rm=T),
+                   maxpostcovid=max(FC.postcovid.mean.smooth,na.rm=T),
+                   medianpostcovid=median(FC.postcovid.mean.smooth,na.rm=T),
+                   meanpostcovid=mean(FC.postcovid.mean.smooth,na.rm=T),
+                   
+                   )
+effect.summz
+write.csv(effect.summz,paste0(f.out,"/RangeMeanEffectSizeClusterByRisk.csv"))
+```
+
+## PLOT cluster epochal effects together
+```{r}
+all.period.clust.rt.long<- all.period.clust.rt.grow3 %>% 
+  select(clusterID, risk, FC.postcovid.mean.smooth,FC.covid.mean.smooth, FC.beforeprep.during.mean.smooth, size) %>%
+  pivot_longer(cols = c(FC.beforeprep.during.mean.smooth, FC.covid.mean.smooth, FC.postcovid.mean.smooth),
+               names_to = "effect", values_to="FoldChange")
+
+all.period.clust.rt.long$Effect<-str_replace_all(all.period.clust.rt.long$effect, c("FC.postcovid.mean.smooth"="Post-COVID-19",
+                                                                                    "FC.covid.mean.smooth"="COVID-19",
+                                                                                    "FC.beforeprep.during.mean.smooth"="PrEP"))
+effect.ord<-c("PrEP","COVID-19","Post-COVID-19")
+all.period.clust.rt.long$Effect<-factor(all.period.clust.rt.long$Effect, levels=effect.ord)
+
+#Make a nice suppy
+all.period.clust.rt.long %>%
+  filter(risk != "HET") %>%
+  ggplot() +
+  geom_hline(yintercept = (1), color="black",linetype=2,linewidth=0.5)+
+  geom_point(aes(y=FoldChange, x=Effect,group=risk, color=risk, size=size),alpha=0.4,
+             position=position_dodge2(width=0.9))+
+  geom_text(aes(y=FoldChange, x=Effect, group=risk, label=clusterID),
+             position=position_dodge2(width=0.9),size=2)+
+  geom_boxplot(aes(y=FoldChange, x=Effect, color=risk),alpha=0.3,width=0.5)+
+  pubTheme+
+  scale_color_manual(values=riskcolz)+
+  labs(x="Epochal effect across clusters", y="Fold-change (during / before)")+
+  theme(legend.position ="right", legend.justification = c(1,1))+
+  guides(color=guide_legend(title="Predominant\ngroup"),
+         size=guide_legend(title="Size, 2022"))
+ggsave(paste0(f.out, "/EpochalEffectsPrEPCOVID_clust.png"),width=8,height=3)
+
+#return full re rate df into a df within list 
+# write.csv(clust.rt, paste0(f.out,"/all.clust.re.",mean.si,std.si,int,".day.csv"))
+# write.csv(all.period.clust.rt.grow, paste0(f.out,"/all.period.clust.re.rate.ym.csv"))
+
+
+## Epochal Rt counterfactual for cases averted
+#by cluster: 
+#During PrEP pre COVID = Pre-prep Re
+#During PrEP during COVID = Pre-prep Re * COVID effect
+#During PrEP post COVID = Pre-prep Re * post-COVID effect
+# or just take the observed mean Rt by cluster and adjust by the estimated PrEP effect on Re (after vs before)
+
+```
+
+
+
+## Join clust composition to Re summaries by period
+calculate percent of clusters by population with reduced Rt following prep
+```{r}
+# what % of GBM clusters had signif reduced Re and growth rates pre vs durign PrEP
+cluster.rt.fuk<-left_join(clust.comp,all.period.clust.rt.grow,  by="clusterID")
+
+## filter for those active since 2018, what percent of clusters predominated by each population had reduced growth rate before vs during prep
+cluster.rt.fuk %>% 
+  filter(active==1) %>%
+    filter(!is.na(FC.before.during.mean.smooth)) %>% #must use those where this can be calculated
+  dplyr::summarise(totalclust=n(),
+                   total.red=length(which(FC.before.during.mean<=1)),
+                   total.smooth.red=length(which(FC.before.during.mean.smooth<=1)),
+                   perc.red=total.smooth.red/totalclust *100)
+#oevrall active clusters:
+#41.2% of clusters with reduced mean Re 
+
+cluster.rt.fuk %>% 
+  filter(active==1) %>%
+  filter(!is.na(FC.before.during.mean.smooth)) %>% #must use those where this can be calculated
+  dplyr::group_by(risk) %>% 
+  dplyr::summarise(totalclust=n(),
+                   total.red=length(which(FC.before.during.mean<=1)),
+                   total.smooth.red=length(which(FC.before.during.mean.smooth<=1)),
+                   perc.red=total.smooth.red/totalclust *100)
+# 9/23 47.8%% GBM active clusters had reduced Re, 
+#2/11=compared to 27.3% of PWID clusters 
+```
+
+# Plot the period averaged FC cluster growth rates and Re 
+```{r}
+cluster.rt.fuk %>% 
+  filter(active==1) %>%
+  filter(!is.na(FC.before.during.mean.smooth)) %>% #must use those where this can be calculated
+  ggplot()+
+  geom_bar(aes(x=factor(clusterID),y=FC.before.during.mean,fill=risk),stat="identity")
+
+## attach the number of new cases since 2018
+
+
+#plot this as a scatter plot
+cluster.rt.fuk %>% 
+  filter(active==1) %>%
+  filter(!is.na(FC.before.during.mean.smooth)) %>% #must use those where this can be calculated
+  ggplot()+
+  geom_point(aes(x=perc_MSM, y=(1/FC.before.during.mean.smooth),color=risk,size=size),stat="identity",alpha=0.7)+
+  pubTheme+
+  labs(x="Proportion GBM in cluster", y="Fold-change cluster Re following PrEP")+ #switched to FC from FR
+  geom_hline(yintercept = (1), color="black",linetype=2,linewidth=0.5)+
+  guides(size=guide_legend(title="Cluster size, 2022"),
+         color=guide_legend(title="Predominant population"))+
+  scale_color_manual(values=riskcolz)+
+  theme(legend.position = c(0.5,0.99),legend.justification = c(0.5,1),legend.box.just = "center")+
+  annotate(geom="text",x=0.1,y=0.8,label="")
+ggsave(paste0(f.out,"/FC_clusterReafterPREP_sizeclust_predomPop.png"),width=5,height=4)
+
+## Repeat this with cluster ID on x axis
+
+cluster.rt.fuk$risk<-factor(cluster.rt.fuk$risk, levels=c("GBM","PWID"))
+
+clust.ord<-c(clust.comp$clusterID[which(clust.comp$risk=="GBM")],
+clust.comp$clusterID[which(clust.comp$risk=="PWID")],
+clust.comp$clusterID[which(clust.comp$risk=="HET")])
+
+clust.ord<-clust.ord [which(clust.ord %in% unique(cluster.rt.fuk$clusterID))]
+
+cluster.rt.fuk$clusterID<-factor(cluster.rt.fuk$clusterID, levels=clust.ord)
+#plot this as a scatter plot
+fc.rt<-cluster.rt.fuk %>% 
+  filter(active==1) %>%
+  filter(!is.na(FC.before.during.mean.smooth)) %>% #must use those where this can be calculated
+  ggplot()+
+  geom_point(aes(x=as.factor(clusterID), y=(FC.before.during.mean.smooth),color=risk,size=size),stat="identity",alpha=0.4)+
+  geom_text(aes(x=as.factor(clusterID), y=(FC.before.during.mean.smooth),group=risk, label=clusterID),size=1.6,stat="identity",alpha=1,
+            fontface="bold")+
+  pubTheme+
+  labs(x="Cluster", y="Fold-change\nRe with PrEP")+
+  geom_hline(yintercept = (1), color="black",linetype=2,linewidth=0.5)+
+  guides(size=guide_legend(title="Cluster size, 2022"),
+         color=guide_legend(title="Predominant population"))+
+  scale_color_manual(values=riskcolz)+
+    scale_size_continuous(range = c(3,7), breaks=c(10,50,100,400))+
+
+  theme(legend.position = "none",
+        axis.text.x=element_blank())+#c(0.5,0.8),legend.justification = c(0.5,1),legend.box = "horizontal")+
+  annotate(geom="text",x=0.1,y=0.8,label="")
+fc.rt
+ggsave(paste0(f.out,"/FC_clusterReafterPREP_sizeclust_predomRisk_Simple.png"),width=10,height=2.2)
+
+```
+
+## Repeat as above, but keep periods separate 
+```{r}
+clust.rt.per2<-left_join(clust.rt.per, clust.comp, by="clusterID")
+clust.rt.per2$period2<-str_replace_all(clust.rt.per2$period, c("Before_PrEP"="Before PrEP",
+                                                               "PrEP_pre-COVID19"="During PrEP\nPre-COVID-19",  
+                                                               "PrEP_COVID19"="During PrEP\nDuring COVID-19", 
+                                                               "PrEP_post-COVID19"="During PrEP\nPost-COVID-19"))
+
+clust.rt.per2$period2<-factor(clust.rt.per2$period2, levels=c("Before PrEP","During PrEP\nPre-COVID-19",
+                                                              "During PrEP\nDuring COVID-19","During PrEP\nPost-COVID-19"))
+period.rt<-clust.rt.per2 %>%  
+  filter(active==1)%>%
+  filter(period %in% c("Before_PrEP","PrEP_pre-COVID19",  "PrEP_COVID19", "PrEP_post-COVID19")) %>%
+  ggplot()+
+  geom_point(aes(x=period2, y=(mean.re.smooth),color=risk,size=size),stat="identity",alpha=0.4,
+             position=position_dodge2(width=0.95,preserve = "single",padding=0.1))+
+  geom_text(aes(x=period2, y=(mean.re.smooth),label=clusterID,group=risk),stat="identity",alpha=1, size=1.6,hjust=0.5,vjust=0.5,
+             position=position_dodge2(width=0.95,preserve = "single",padding=0.1),fontface="bold")+
+  pubTheme+
+  labs(x=NULL, y="Average Re")+
+  geom_hline(yintercept = (1), color="black",linetype=2,linewidth=0.5)+
+  guides(size=guide_legend(title="Cluster size, 2022"),
+         color=guide_legend(title="Predominant population"))+
+  scale_color_manual(values=riskcolz)+
+  scale_size_continuous(range = c(3,7), breaks=c(10,100,400))+
+  # scale_x_discrete(expand=expansion(0.02,0.02))+
+  theme(legend.position = c(0.1,0.99),legend.justification = c(0,1),legend.box = "horizontal", plot.margin = margin(2,2,2,2,"pt"))+
+  annotate(geom="text",x=0.1,y=0.8,label="")
+period.rt
+ggsave(paste0(f.out,"/Period_clusterRe_sizeclust_predomPop.png"),width=10,height=3.5)
+
+```
+
+### MAKE a grobby fig
+```{r}
+plot_grid(facet.clust, period.rt,fc.rt, labels=LETTERS[1:3], align="v",axis="l", ncol=1, rel_heights = c(0.9,1,0.5))
+ggsave(paste0(f.out, "/Fig3_RtClust.png"),height=8,width=10)
+```
+
+
+# Deterministic counterfactual modeling
+```{r}
+#Expected cases in delta t = growth rate at t-1 [new cases per cluster size per year] * cluster size in 2018 * n years
+
+#in actively growing clustres...
+#use the period averaged growth rate before PrEP to calculate how many new cases expected in 2018-feb 2021
+#comapre to observed new cases in active clusters in 2018-feb 2021
+cluster.fuk.ls<-cluster.fuk %>%
+  filter(active==1) %>%
+  filter(FC.before.during.mean != "NA") 
+    
+#mutate new col for potential cases in jan 2018-feb 2020 (26 months)
+#need cluster size in 2018 (cumulative members up until then minus deaths)
+clustsize.2018<-all.clust.grow%>% filter(yearmonth == "Jan 2018") %>% select(clusterID,size)
+colnames(clustsize.2018)[2]<-"clustsize.2018"
+cluster.fuk.ls<-cluster.fuk.ls %>% left_join(clustsize.2018, by="clusterID")
+#change to smoth as neededd
+cluster.fuk.ls<-cluster.fuk.ls %>% mutate(cases.noprep = mean.growth.smooth_Before_PrEP /12 * 26 * clustsize.2018)
+
+##OKAYY 
+#Expected cases in actively growing clusters with no PrEP
+total.expected.noprep<-cluster.fuk.ls[c("clusterID","cases.noprep")]
+total.expected.noprep$cases.noprep<-round(total.expected.noprep$cases.noprep)
+SUMtotal.expected.noprep<-sum(total.expected.noprep$cases.noprep) #259 in 26 months
+SUMtotal.expected.noprep
+
+
+#clust that we included:
+clust.counter<-unique(cluster.fuk.ls$clusterID)
+length(clust.counter) #79 #techinically 84 that have been active since 2018, but 5 removed bc growth rate was NA before or after PREP
+#what about non actively growing clustres? ie those outsdie of a cluster, should we consier tthat as a separate growth rate
+
+#Observed 
+dtp.red4 #df of cluster cases over time
+dtp.red4.2<-dtp.red4 %>% left_join(clust.comp[,c("clusterID","active","active22")],by="clusterID")
+#shuold also filter to the same clusters (actively growing since 2017)
+
+total.observed.prep<-dtp.red4%>% 
+  filter(clusterID %in% clust.counter) %>%
+  dplyr::group_by(clusterID)%>%
+  filter(FIRST_VL_DATE < as.Date("2020-03-01") &
+         FIRST_VL_DATE >= as.Date("2018-01-01") ) %>%
+  tally()
+SUMtotal.observed.prep<-sum(total.observed.prep$n)
+SUMtotal.observed.prep #202
+
+# TOTAL AVERTED IN ACTIVELY GROWING CLUSTERS
+SUMaverted<-SUMtotal.expected.noprep - SUMtotal.observed.prep
+#57 total averted
+#PER MONTH pre-covid
+
+
+
+## REPEAT not filtering for active clusters with non NA
+total.observed.prep.all<-dtp.red4%>% 
+  # filter(clusterID %in% clust.counter) %>%
+  dplyr::group_by(clusterID)%>%
+  filter(FIRST_VL_DATE < as.Date("2020-03-01") &
+         FIRST_VL_DATE >= as.Date("2018-01-01") ) %>%
+  tally()
+sum(total.observed.prep.all$n) #214
+202/214*100 #94% of observed new cases in 2018 to 2020 Feb were in actively growing clusters with non-NA growth rates
+
+# in what clsuters was prep most effective
+#join the two together into one df
+colnames(total.observed.prep.all)[2]<-"cases.prep"
+
+obs.expect.all<-left_join(total.observed.prep.all, total.expected.noprep, by="clusterID")
+obs.expect.all <- obs.expect.all %>% mutate(cases.averted= cases.noprep - cases.prep)
+
+## UPPER LIMIT
+#what if we dont' include the negatives averted in clusters
+SUMaverted2<-obs.expect.all %>%
+  filter(cases.averted>=0) %>%
+  summarize(total=sum(cases.averted))
+
+SUMaverted2 #125
+
+SUMaverted/26
+SUMaverted2/26
+
+
+#look at distrib of cases averted
+table(obs.expect.all$cases.averted)
+#there are negative instances where the observed growth rate increased following prep, therefore we see more obs than expected
+#whihc clusters had most (14,19,21, 28)
+obs.expect.all<-obs.expect.all[order(obs.expect.all$cases.averted,decreasing = T),]
+#link to clust comp
+obs.expect.all.2<-obs.expect.all %>% left_join(clust.comp,by="clusterID")
+
+#the four clusters with most cases averted were predom GBM
+mostaverted<-obs.expect.all.2 %>% filter(cases.averted>10)
+
+```
+
+## Poisson/NegBin model of cases averted in clusters: assoc with median age, % HA, % population
+```{r}
+#association with age?
+#cant have negatives for poisson
+obs.expect.all.3<-obs.expect.all.2
+# obs.expect.all.3$cases.averted[which(obs.expect.all.3$cases.averted<0)]<-0
+#instead of removing zeroes, normalize to the lowest value
+min<--min(obs.expect.all.3$cases.averted, na.rm = T)
+obs.expect.all.3$cases.averted<-obs.expect.all.3$cases.averted+min
+mod<-glm(data= obs.expect.all.3, cases.averted ~ perc_MSM+ medianAge2023, family="poisson")
+summary(mod)
+exp(mod$coefficients)
+
+#add ha in there?
+mod2<-glm(data= obs.expect.all.3, cases.averted ~ perc_MSM+ medianAge2023+perc_HA_Van , family="poisson")
+summary(mod2)
+anova(mod,mod2,"LRT")
+exp(mod2$coefficients)
+
+#add ha in there?
+mod3<-glm(data= obs.expect.all.3, cases.averted ~ perc_MSM+ medianAge2023+perc_HA_Van+perc_PREP , family="poisson")
+summary(mod3)
+exp(mod3$coefficients)
+
+#LEAST EFFECTIVE
+#mutate a new column that is relative % averted = cases averted / cases observed
+obs.expect.all.2 <-obs.expect.all.2 %>% mutate(relaverted = cases.averted / cases.prep *100)
+table(obs.expect.all.2$relaverted)
+obs.expect.all.4<-obs.expect.all.2 [,c("clusterID","risk","relaverted","cases.averted","cases.prep","cases.noprep")]
+
+```
+
+## Plot cases averted across clusters
+```{r}
+clusterorder<-obs.expect.all.2$clusterID[obs.expect.all.2$active==1]
+obs.expect.all.2$clusterID<-factor(obs.expect.all.2 $clusterID, levels=)
+
+##PLOT THIS
+obs.expect.all.2 %>%
+  filter(active==1) %>%
+  ggplot()+
+  geom_bar(aes(x=clusterID, y=cases.averted, fill=risk), stat="identity",alpha=0.7)+
+  pubTheme+
+  scale_fill_manual(values=riskcolz)+
+  labs(x="Active clusters",y="Cases averted (expected no PreP - observed w/ PrEP)")+
+  guides(fill=guide_legend(title="Predominant population"))+
+  theme(legend.position = c(0.9,0.95), legend.justification = c(1,1),
+        axis.text.x=element_text(angle=45,hjust=1,vjust=1)
+        )+
+  scale_y_continuous(breaks=seq(-15,80,5),expand=c(0.1,0))
+ggsave(paste0(f.out,"/CasesAvertedByRiskGrp.png"),width=8.5,height=4)
+
+```
+## Key clusters
+```{r}
+# 1. Have >=5 PUWS in them and/or m184IV (22(m184iv), 168,  95, 31(m184iv) ),
+# prep.clust<-unique(dtp.count.clust.c$clusterID[which(dtp.count.clust.c$n_PREP>=2)]) #22  26  31  41  95  114 168
+# unique(dtp.count.clust.c$size[which(dtp.count.clust.c$n_PREP>=2)])
+# 
+# # 2. largest, >=50 (57,  49,  31 , 95  ,13  ,137 ,156 ,142, 201, 110 ,175 ,105 ,204)
+# bigger.ones<-unq.clust$clusterID[which(unq.clust$size>=50)]
+# length(bigger.ones) #13
+# bigger.ones
+# # bigish.ones<-unq.clust$clusterID[which(unq.clust$size>=20)]
+# # length(bigish.ones) #41
+# 
+# #3a. most new cases
+# cl.mostcase<-unique(clust.rt$clusterID[clust.rt$n_seroconv_2018>=10])
+# 
+# #3b. mean and lower bound Re above 1 during one of these periods
+# cl.highR<-clust.rt %>%
+#   filter(too.wide==F) %>%
+#   filter(period%in% c("PrEP_pre-COVID19","PrEP_COVID19","PrEP_post-COVID19")) %>%
+#   filter(meanR_smooth >= 1) %>%
+#   filter(Quantile.0.025.R.>=1) %>%
+#   distinct(clusterID)#, .keep_all = T)
+# cl.highR
+# 
+# # 4. Non-B (22, 241?, 95, 185)
+# clF<-unique(dtp.count.clust.c$clusterID[dtp.count.clust.c$n_subF>0]) #22
+# clC<-unique(dtp.count.clust.c$clusterID[dtp.count.clust.c$n_subC>0]) #187
+# clAE<-unique(dtp.count.clust.c$clusterID[dtp.count.clust.c$n_subAE>0]) #185
+# #what about recomb B?
+# 
+# #JOIN all theses into one vector of key clusters
+# key.clust<-unique(c(prep.clust,bigger.ones,cl.mostcase))#, cl.highR, clF,clC,clAE))
+# length(key.clust)
+# sort(key.clust)
+# 
+# write.csv(key.clust , paste0(f.out, "/key.clusters.csv"))
+```
+
+# Define Re for stochastic simulation of clusters growth
+
+## define the epochal Rt to get period effects of COVID-19,postcovid, then apply to the pre-PrEP counterfact Re during COVID
+```{r}
+# By population, what were epochal changes due to COVID
+paramset.foc<-"mean365_std182_int182"
+re.pwid<-read.csv("../BC_Rt_EpiEstim/2024-05-28_Results/Re_RskGrp/all.re.pwid.df.csv")
+re.pwid <- re.pwid %>% filter(paramset ==paramset.foc) %>% filter(date_start>=as.Date("2015-01-01"))
+# nrow(re.pwid)
+
+re.msm<-read.csv("../BC_Rt_EpiEstim/2024-05-28_Results/Re_RskGrp/all.re.msm.df.csv")
+re.msm <- re.msm %>% filter(paramset ==paramset.foc)%>% filter(date_start>=as.Date("2015-01-01"))
+
+re.het<-read.csv("../BC_Rt_EpiEstim/2024-05-28_Results/Re_RskGrp/all.re.het.df.csv")
+re.het <- re.het %>% filter(paramset ==paramset.foc)%>% filter(date_start>=as.Date("2015-01-01"))
+
+#PERIODs
+per1<-c("2016-01-01","2017-12-31")
+per2<-c("2018-01-01","2020-02-29")
+per3<-c("2020-03-01","2021-12-31")
+per4<-c("2022-01-01","2023-02-28")
+
+#GROUPIES
+re.het$Group<-"HET"
+re.pwid$Group<-"PWID"
+re.msm$Group<-"MSM"
+
+#BINDD
+focal.re.s<-bind_rows(re.het, re.msm, re.pwid)
+
+# for each population and overall
+table(focal.re.s$Group)
+
+#join period onto rows based on date 
+focal.re.s$period<-NA
+for(i in 1:nrow(focal.re.s)){
+  dt<-as.Date(focal.re.s$date_end[i]) 
+  if(dt<per1[1]){next} #if before 2016, then leave as NA
+  if(dt>=per1[1] & dt<=per1[2]){focal.re.s$period[i]<-"Before PrEP"; next} #if in period 1: beforePrEP
+  if(dt>=per2[1] & dt<=per2[2]){focal.re.s$period[i]<-"During PrEP\nPre-COVID-19"; next} 
+  if(dt>=per3[1] & dt<=per3[2]){focal.re.s$period[i]<-"During PrEP\nDuring COVID-19"; next} 
+  if(dt>=per4[1] & dt<=per4[2]){focal.re.s$period[i]<-"During PrEP\nPost-COVID-19"; next} 
+}
+# table(focal.re.s$period)
+
+periods<-c("Before PrEP","During PrEP\nPre-COVID-19","During PrEP\nDuring COVID-19","During PrEP\nPost-COVID-19")
+focal.re.s$period<-factor(focal.re.s$period, levels=periods)
+focal.re.s2<-focal.re.s
+focal.re.s2<-focal.re.s2 %>% filter(!is.na(focal.re.s$period))
+
+#group by period 
+#calculate piecewise average and stdev for Re in the period, group
+focal.re.s.per<-focal.re.s %>% 
+  dplyr::group_by(Group, period) %>%
+  dplyr::summarise(.groups="rowwise",
+                   medianRe=median(meanR_smooth90,na.rm=T), #TAKE the median of the means
+                   meanRe=mean(meanR_smooth90,na.rm=T),
+                   sdRe=sd(meanR_smooth90,na.rm=T),
+                   
+                   meanquant025=mean(quant0.025_smooth90,na.rm=T),
+                   medianquant025=median(quant0.025_smooth90,na.rm=T),
+                   
+                   meanquant975=mean(quant0.975_smooth90,na.rm=T),
+                   medianquant975=median(quant0.975_smooth90,na.rm=T),) #SD across daily estimates
+focal.re.s.per<-focal.re.s.per %>% filter(!is.na(period))
+
+p.re.averages<-ggplot()+
+  geom_violin(data=focal.re.s2, aes(x=period, y=meanR_smooth90,fill=Group), alpha=0.3, width=0.8,
+              position=position_dodge(width = 0.75),lwd=0.1)+
+  # geom_boxplot(data=focal.re.s2, aes(x=period, y=meanR_smooth90,fill=Group, color=Group), width=0.5, alpha=0.3, 
+  #              position=position_dodge(width = 0.75),lwd=0.1)+
+  #Add medians
+  geom_point(data=focal.re.s.per, aes(x=period, y=medianRe,group=Group, color=Group),shape="-",size=7,alpha=0.6,
+                            position=position_dodge(width = 0.75))+
+  scale_fill_manual(values=riskcolz)+
+  scale_color_manual(values=riskcolz)+
+  pubTheme+
+  labs(x=NULL, y="Average Re")+
+  geom_hline(yintercept = 1,color="red",linetype=5, linewidth=0.5, alpha=0.7)+
+  theme(#axis.text.x = element_text(angle = 0, hjust=1,vjust=1),
+        legend.position="none")
+p.re.averages
+
+#NOW what is the Diff between these?
+focal.re.s.per.w<-focal.re.s.per %>% 
+  select(c(Group,medianRe, period)) %>% 
+  pivot_wider(names_from = period, values_from = medianRe)
+
+focal.re.s.per.w<-focal.re.s.per.w %>% mutate(prep.effect = `During PrEP\nPre-COVID-19`/ `Before PrEP`,
+                                              covid.effect = `During PrEP\nDuring COVID-19`/`During PrEP\nPre-COVID-19`,
+                                              postcovid.effect = `During PrEP\nPost-COVID-19` / `During PrEP\nDuring COVID-19`)
+focal.re.s.per.w
+```
+
+# Define Rt for counterfactual by cluster
+```{r}
+##cluster Rt over time observed
+clust.rt.obs<-clust.rt.mod %>% 
+  select(c(clusterID, meanR_smooth, date_start, date_end,Quantile.0.025.R., Quantile.0.975.R.))
+colnames(clust.rt.obs)[c(5,6)]<-c("quantile.025","quantile.975")
+
+#unique clusters
+cl.un<-unique(clust.rt.obs$clusterID)
+
+# Ensure entire length 2018-01-01 to 2023-02-01 covered
+date.range.cf<-as.Date(c("2018-01-01","2023-01-01"))
+date.vector.cv<-as.Date(date.range.cf[1] : date.range.cf[2], origin="1970-01-01")
+length(date.vector.cv) #simulation length
+
+clust.rt.full<-replicate(length(cl.un), vector())
+
+#Check all dates covered and no NAs, otherwise default Re < 1 (receding)
+default.re<-0.8
+
+for (i in 1:length(cl.un)){
+  myclust.df<-clust.rt.obs[clust.rt.obs$clusterID==cl.un[i],]
+  #remove NAs from observed data
+  na.r<-which(is.na(myclust.df$meanR_smooth))
+  if(length(na.r)>0){
+    myclust.df<-myclust.df[-na.r, ]
+  }
+  
+  newcases2<-data.frame(clusterID=rep(cl.un[i],length(date.vector.cv)), 
+                        meanR_smooth=rep(default.re, length(date.vector.cv)), 
+                        date_start=date.vector.cv, date_end=date.vector.cv+182,
+                        quantile.025=rep(default.re, length(date.vector.cv)), 
+                        quantile.975=rep(default.re, length(date.vector.cv)))
+  for (j in 1:nrow(myclust.df)){
+    #if value found, replace it in empty df. could make sapply
+    if (!is.na(myclust.df$meanR_smooth[j])){ 
+      match<-which(newcases2$date_start==myclust.df$date_start[j])
+      newcases2$meanR_smooth[match]<-myclust.df$meanR_smooth[j]
+      newcases2$quantile.025[match]<-myclust.df$quantile.025[j]
+      newcases2$quantile.975[match]<-myclust.df$quantile.975[j]
+    }
+  }
+  #export the full df in new list
+  clust.rt.full[[i]]<-newcases2
+}
+
+#bind
+clust.rt.cf<-bind_rows(clust.rt.full)
+
+##multiply Rt by prep effect (before/during is a fold reduction)
+#i.e. 2/1 2=fold red; so multiply by the adjustment; if observed Re=1.5 and adj factor due to prep is 2, then Re counterfactual is 3)
+#counterfactual Re: default as same as smooth obs with 0.5 where no value
+clust.rt.cf$meanR_cf<-NA
+clust.rt.cf$adj<-NA
+
+# Sets of clusters that had cases too high or too low in simulations based on obsreved Re
+#use the upper or lower Re instead of mean where appropriate in the observed
+toolow<-c(9999,31, 168, 114, 95,22, 205,219)
+toohigh<-c(40, 49, 52, 57, 182, 207, 202, 197, 196)
+
+for(i in 1:length(cl.un)){
+  clu<-cl.un[i]  
+  #if cluster cases were too low, replace mean R observed with the upper quantile R observed
+  if(clu %in% toolow){
+    match<-which(clust.rt.cf$clusterID==clu)
+    clust.rt.cf$meanR_smooth[match]<-clust.rt.cf$quantile.975[match]
+  }  
+  #if cluster cases were too high, replace mean R observed with the lower quantile R observed
+  if(clu %in% toohigh){
+    match<-which(clust.rt.cf$clusterID==clu)
+    clust.rt.cf$meanR_smooth[match]<-clust.rt.cf$quantile.025[match]
+  }
+}
+
+#for each cluster, divide R by PrEP effect to simulate absence of prep
+for (i in 1:length(cl.un)){
+  clu<-cl.un[i]
+  #adjustment factor (prep effect on this cluster)
+  #adj is greater than 1 where prep had a reducing effect (before>during)
+  adj<-cluster.rt.fuk$FC.before.during.mean.smooth[which(cluster.rt.fuk$clusterID==clu)]
+  
+  #some won't have adj, so instead lookup the mean FC for its key pop
+  if(!length(adj)>0){
+    myrsk<-cluster.rt.fuk$risk[which(cluster.rt.fuk$clusterID==clu)]
+    myrsk<-str_replace_all(myrsk,"GBM","MSM") #diff lookup
+    adj<-focal.re.s.per.w$prep.effect[focal.re.s.per.w$Group==myrsk]
+  }
+  #workaround to do same for NAs
+  if(length(adj)>0){
+    if(is.na(adj)){
+      myrsk<-cluster.rt.fuk$risk[which(cluster.rt.fuk$clusterID==clu)]
+      myrsk<-str_replace_all(myrsk,"GBM","MSM") #diff lookup
+      adj<-focal.re.s.per.w$prep.effect[focal.re.s.per.w$Group==myrsk]
+    } 
+  }
+  myclu<-which(clust.rt.cf$clusterID==clu &
+                 clust.rt.cf$date_start>as.Date("2018-01-01"))
+  
+  #Assume that PrEP could only have a protective effect? could have an opposite effect if not used properly or ...?
+  #can also ignore the neg. cases averted later 
+  
+  #ADJUST values after 2018  
+  clust.rt.cf$meanR_cf [myclu] <- clust.rt.cf$meanR_smooth [myclu] * (1/adj)
+  clust.rt.cf$adj [myclu] <- 1/adj #track
+
+}
+
+#make long predicted and observed Re
+clust.rt.cf.long<-clust.rt.cf %>% pivot_longer(cols=c(meanR_smooth, meanR_cf), 
+                                               names_to = "Type", values_to = "Re")
+
+
+clust.rt.cf.long$Type<-str_replace_all(clust.rt.cf.long$Type, c("meanR_cf"="Re_NoPrEP",
+                                                                "meanR_smooth"="Re_observed"))
+
+#check
+# ggplot(clust.rt.cf.long)+
+#   geom_line(aes(x=date_end, y=Re, group=Type, color=Type))+
+#   facet_wrap(~clusterID,scales="free_y")+
+#   pubTheme+
+#   theme(axis.text.x=element_text(angle=90, hjust=1,vjust=1))+
+#   scale_x_date(limits=as.Date(c("2018-01-01","2023-01-01")), date_breaks = "1 year",date_labels = "%Y")+
+#   labs(x=NULL)
+# ggsave(paste0(f.out, "/Re_ByCluster_ObsPredPrEP.png"),height=18,width=20)
+
+#ONLY looking at ones where 0.5 not specified as observed 
+clust.rt.cf.long %>%
+  filter(clusterID %in% med.active.clust) %>%
+  ggplot()+
+  geom_line(aes(x=date_end, y=Re, group=Type, color=Type))+
+  facet_wrap(~clusterID,scales="free_y",nrow=6)+
+  pubTheme+
+  theme(axis.text.x=element_text(angle=45, hjust=1,vjust=1),
+        legend.position="top")+
+  scale_x_date(limits=as.Date(c("2018-01-01","2023-01-01")), date_breaks = "1 year",date_labels = "%Y")+
+  labs(x=NULL)
+ggsave(paste0(f.out, "/Re_ByCluster_ObsPredPrEP_keyclust.png"),height=7,width=8.5)
+
+# Export this table to read into the stochastic BP script
+write.csv(clust.rt.cf.long, file = paste0(f.out, "/Re.epochal.clusters.csv"))
+```
+
+
+## Define size of active clusters at end of 2017 (minus deceased, emigrated, regardless of VL)
+```{r}
+sz2017<-dtp.red5 %>% group_by(clusterID) %>%
+  filter(FIRST_VL_DATE<=as.Date("2018-01-01")) %>%
+  filter(END_FOLLOW_STATUS.x %in% c("death_non_accid","death_accid","cens_MV")) %>%
+  dplyr::summarise(size2017=n())
+write.csv(sz2017, paste0(f.out, "/Size2017.clusters.csv"))
+```
+
+
+## ratio of diagnosed to seqeunced in recent years only
+```{r}
+fulldtp<-read.csv("../../00_data/01_clean/clean_output/dtp.csv")
+
+#with seq 
+dtp.phylo<-read.csv("../../00_data/01_clean/clean_output/phyloDTP.csv")
+#overal percentage with seq
+nrow(dtp.phylo)/nrow(fulldtp)
+
+#only interested in ratio of those with VL test since 2018
+fulldtp.r<-fulldtp %>% filter(as.Date(FARVDT)>=as.Date("2018-01-01"))
+fulldtp.r$year<-year(fulldtp.r$FARVDT)
+table(fulldtp.r$year)
+dtp.phylo.r<-dtp.phylo %>% filter(as.Date(FIRST_VL_DATE)>=as.Date("2018-01-01"))
+dtp.phylo.r$year<-year(dtp.phylo.r$FARVDT)
+table(dtp.phylo.r$year)
+
+#recent percentage:
+nrow(dtp.phylo.r)/nrow(fulldtp.r)
+```
+
+N diagnoses per year among PUWS and NPUWS
+```{r}
+```
+
